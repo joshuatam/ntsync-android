@@ -110,12 +110,49 @@ struct Header {
 const HEADER_SIZE: usize = std::mem::size_of::<Header>();
 
 // Bionic exports the robust process-shared pthread mutex API (API 28+) but
-// the libc crate does not expose all of it for Android.
+// the libc crate does not expose it for Android, and the NDK stub libc.so
+// omits both symbols entirely, which breaks consumers linking with
+// --no-allow-shlib-undefined. Resolve them via dlsym at runtime instead.
 #[cfg(target_os = "android")]
-extern "C" {
-    fn pthread_mutex_consistent(lock: *mut libc::pthread_mutex_t) -> i32;
-    fn pthread_mutexattr_setrobust(attr: *mut libc::pthread_mutexattr_t, robust: i32) -> i32;
+mod robust {
+    use std::sync::OnceLock;
+
+    type ConsistentFn = unsafe extern "C" fn(*mut libc::pthread_mutex_t) -> i32;
+    type SetrobustFn = unsafe extern "C" fn(*mut libc::pthread_mutexattr_t, i32) -> i32;
+
+    // Fallbacks if the symbols are somehow missing: without robust mutexes the
+    // kernel never reports EOWNERDEAD, so no-op consistent/setrobust is safe.
+    unsafe extern "C" fn consistent_stub(_: *mut libc::pthread_mutex_t) -> i32 { 0 }
+    unsafe extern "C" fn setrobust_stub(_: *mut libc::pthread_mutexattr_t, _: i32) -> i32 { 0 }
+
+    static FUNCS: OnceLock<(ConsistentFn, SetrobustFn)> = OnceLock::new();
+
+    fn funcs() -> (ConsistentFn, SetrobustFn) {
+        *FUNCS.get_or_init(|| unsafe {
+            let handle = libc::dlopen(b"libc.so\0".as_ptr().cast(), libc::RTLD_NOW);
+            let lookup = |name: &[u8]| -> *mut libc::c_void {
+                if handle.is_null() { return std::ptr::null_mut(); }
+                libc::dlsym(handle, name.as_ptr().cast())
+            };
+            let consistent = lookup(b"pthread_mutex_consistent\0");
+            let setrobust = lookup(b"pthread_mutexattr_setrobust\0");
+            (
+                if consistent.is_null() { consistent_stub } else { std::mem::transmute::<*mut libc::c_void, ConsistentFn>(consistent) },
+                if setrobust.is_null() { setrobust_stub } else { std::mem::transmute::<*mut libc::c_void, SetrobustFn>(setrobust) },
+            )
+        })
+    }
+
+    pub unsafe fn pthread_mutex_consistent(lock: *mut libc::pthread_mutex_t) -> i32 {
+        funcs().0(lock)
+    }
+
+    pub unsafe fn pthread_mutexattr_setrobust(attr: *mut libc::pthread_mutexattr_t, robust: i32) -> i32 {
+        funcs().1(attr, robust)
+    }
 }
+#[cfg(target_os = "android")]
+use robust::{pthread_mutex_consistent, pthread_mutexattr_setrobust};
 
 #[cfg(target_os = "android")]
 const PTHREAD_PROCESS_SHARED: i32 = 1;

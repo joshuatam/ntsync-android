@@ -41,6 +41,9 @@ build_one() {
   if ! rustup target list --installed | grep -q "$triple"; then
     rustup target add "$triple"
   fi
+  # cargo reads .cargo/config.toml (16KB page-size rustflags) relative to the
+  # working directory, not the manifest; build from the project root so it applies.
+  cd "$PROJECT_ROOT"
   env "$var=$TOOLCHAIN/$target-clang" \
       AR="$TOOLCHAIN/llvm-ar" \
       cargo build --release --target "$triple" --manifest-path "$PROJECT_ROOT/Cargo.toml"
