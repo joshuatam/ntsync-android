@@ -30,7 +30,7 @@ use std::time::Duration;
 pub const MAX_WAIT_COUNT: usize = 64;
 
 const MAGIC: u64 = 0x6E7473796E635F75; // "ntsyc_u"
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const SLOT_COUNT: u32 = 16384;
 const INDEX_BITS: u32 = 14; // log2(SLOT_COUNT)
 const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
@@ -102,7 +102,11 @@ struct Header {
     global_seq: AtomicU32,
     /// Allocation cursor.
     next_scan: u32,
-    _pad: [u32; 3],
+    /// Debug: which thread currently holds `lock` (0 = none). Written after
+    /// acquiring, cleared before releasing; only meaningful while locked.
+    lock_owner_pid: u32,
+    lock_owner_tid: u32,
+    _pad: [u32; 1],
     lock: libc::pthread_mutex_t,
     // Slot array follows immediately.
 }
@@ -214,19 +218,59 @@ impl Region {
 
     fn lock_guard(&self) -> Result<RegionGuard<'_>, i32> {
         let lock = &self.header().lock as *const libc::pthread_mutex_t as *mut _;
+        let debug = debug_enabled();
+        let mut waited = std::time::Duration::ZERO;
+        // Wine suspends threads with SIGUSR1; if it lands while we hold the
+        // shared region mutex the holder stays parked and every process
+        // (including wineserver) wedges on the lock. Defer it until release.
+        let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        let mut block = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        unsafe {
+            libc::sigemptyset(&mut block);
+            libc::sigaddset(&mut block, libc::SIGUSR1);
+            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old_mask);
+        }
         loop {
-            let ret = unsafe { libc::pthread_mutex_lock(lock) };
-            if ret == 0 {
-                return Ok(RegionGuard { region: self });
+            let ret = if debug {
+                // Poll with a timeout so a stuck holder can be logged.
+                let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+                unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+                ts.tv_sec += 5;
+                unsafe { libc::pthread_mutex_timedlock(lock, &ts) }
+            } else {
+                unsafe { libc::pthread_mutex_lock(lock) }
+            };
+            if ret == 0 || ret == libc::EOWNERDEAD {
+                if ret == libc::EOWNERDEAD {
+                    // Previous holder died mid-operation; the object states are
+                    // still structurally valid because every op is a small,
+                    // single-pass mutation.
+                    unsafe { pthread_mutex_consistent(lock) };
+                }
+                if debug {
+                    let h = self.header() as *const Header as *mut Header;
+                    unsafe {
+                        (*h).lock_owner_pid = std::process::id();
+                        (*h).lock_owner_tid = current_tid();
+                    }
+                }
+                return Ok(RegionGuard { region: self, old_mask });
             }
-            if ret == libc::EOWNERDEAD {
-                // Previous holder died mid-operation; the object states are
-                // still structurally valid because every op is a small,
-                // single-pass mutation.
-                unsafe { pthread_mutex_consistent(lock) };
-                return Ok(RegionGuard { region: self });
+            if ret == libc::ETIMEDOUT {
+                waited += std::time::Duration::from_secs(5);
+                let h = self.header();
+                debug_log(&format!(
+                    "region lock blocked {:?} (pid {} tid {}): held by pid {} tid {}",
+                    waited,
+                    std::process::id(),
+                    current_tid(),
+                    h.lock_owner_pid,
+                    h.lock_owner_tid,
+                ));
+                continue;
             }
             if ret != libc::EINTR {
+                unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut()) };
                 return Err(-ret);
             }
         }
@@ -271,13 +315,24 @@ impl Region {
 
 struct RegionGuard<'a> {
     region: &'a Region,
+    old_mask: libc::sigset_t,
 }
 
 impl Drop for RegionGuard<'_> {
     fn drop(&mut self) {
-        let lock = &self.region.header().lock as *const libc::pthread_mutex_t as *mut _;
-        unsafe { libc::pthread_mutex_unlock(lock) };
+        let h = self.region.header() as *const Header as *mut Header;
+        unsafe {
+            (*h).lock_owner_pid = 0;
+            (*h).lock_owner_tid = 0;
+            let lock = &(*h).lock as *const libc::pthread_mutex_t as *mut _;
+            libc::pthread_mutex_unlock(lock);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.old_mask, std::ptr::null_mut());
+        }
     }
+}
+
+fn current_tid() -> u32 {
+    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
 }
 
 fn open_and_map(path: &str) -> Result<Region, i32> {
@@ -637,6 +692,74 @@ fn try_acquire(slot: &mut Slot, owner: u32, entry_seq: u64) -> Option<bool> {
 /// the kernel's ntsync_wait_args.alert: if it is (or becomes) signaled, the
 /// wait completes with index == handles.len(). The alert event is only
 /// tested, never acquired (wineserver resets it when the APC queue empties).
+/// Log to logcat (liblog is linked into ntdll.so/wineserver) and stderr.
+fn debug_log(msg: &str) {
+    eprintln!("{msg}");
+    #[cfg(target_os = "android")]
+    unsafe {
+        __android_log_write(4, c"ntsync".as_ptr(), std::ffi::CString::new(msg).unwrap_or_default().as_ptr());
+    }
+}
+
+#[cfg(target_os = "android")]
+unsafe extern "C" {
+    fn __android_log_write(prio: i32, tag: *const libc::c_char, text: *const libc::c_char) -> i32;
+}
+
+fn debug_enabled() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        let on = std::env::var_os("NTSYNC_DEBUG")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        if on {
+            debug_log(&format!("watchdog armed (pid {})", std::process::id()));
+        }
+        on
+    })
+}
+
+/// Dump the state of every object involved in a stuck wait, to distinguish
+/// a lost wakeup (object signaled while we sleep) from a never-coming signal.
+fn debug_dump_stuck_wait(
+    r: &Region,
+    handles: &[u32],
+    owner: u32,
+    alert: u32,
+    all: bool,
+    start: std::time::Instant,
+) {
+    let type_name = |t: u32| match t {
+        TYPE_EVENT => "event",
+        TYPE_MUTEX => "mutex",
+        TYPE_SEM => "sem",
+        _ => "?",
+    };
+    debug_log(&format!(
+        "stuck wait: {:?} elapsed, {} owner={} seq={} alert={:#x}",
+        start.elapsed(),
+        if all { "all" } else { "any" },
+        owner,
+        r.seq(),
+        alert,
+    ));
+    if let Ok(_g) = r.lock_guard() {
+        for h in handles.iter().copied().chain((alert != 0).then_some(alert)) {
+            match r.slot(h) {
+                Some(slot) => unsafe {
+                    let s = &*slot;
+                    let locked = is_locked(s, owner, s.d);
+                    debug_log(&format!(
+                        "  {:#010x} {} state={} a={} b={} c={} d={} pid={} gen={} now_signaled={}",
+                        h, type_name(s.obj_type), s.state, s.a, s.b, s.c, s.d, s.pid, s.generation, locked,
+                    ));
+                },
+                None => debug_log(&format!("  {:#010x} <closed/invalid>", h)),
+            }
+        }
+    }
+}
+
 pub fn wait_any(handles: &[u32], owner: u32, timeout: Option<Duration>, alert: u32) -> WaitOutcome {
     wait(handles, owner, timeout, false, alert)
 }
@@ -672,6 +795,9 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
     }
 
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
+    let debug = debug_enabled();
+    let start = std::time::Instant::now();
+    let mut last_dump = start;
 
     // Validate handles and snapshot event pulse sequences at wait entry.
     let mut entry_seqs = [0u64; MAX_WAIT_COUNT];
@@ -761,9 +887,25 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             None => None,
         };
 
-        match r.wait_seq(seq, remaining) {
+        // With NTSYNC_DEBUG=1, cap each futex wait at 5s so a stuck wait
+        // periodically dumps the object states to stderr.
+        let slice = if debug {
+            Some(remaining.map_or(Duration::from_secs(5), |r| r.min(Duration::from_secs(5))))
+        } else {
+            remaining
+        };
+
+        match r.wait_seq(seq, slice) {
             0 | libc::EAGAIN => {}
-            x if x == libc::ETIMEDOUT => return WaitOutcome::Timeout,
+            x if x == libc::ETIMEDOUT => {
+                if deadline.is_some_and(|dl| std::time::Instant::now() >= dl) {
+                    return WaitOutcome::Timeout;
+                }
+                if debug && last_dump.elapsed() >= Duration::from_secs(5) {
+                    debug_dump_stuck_wait(r, handles, owner, alert, all, start);
+                    last_dump = std::time::Instant::now();
+                }
+            }
             _ => {} // EINTR and friends: loop and re-check
         }
     }

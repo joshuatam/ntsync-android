@@ -49,10 +49,10 @@ mod tests {
         setup();
         let h = create_semaphore(2, 5).unwrap();
         assert!(create_semaphore(6, 5).is_err());
-        assert!(is_signaled(wait_any(&[h], 1, Some(Duration::ZERO)), 0));
-        assert!(is_signaled(wait_any(&[h], 1, Some(Duration::ZERO)), 0));
+        assert!(is_signaled(wait_any(&[h], 1, Some(Duration::ZERO), 0), 0));
+        assert!(is_signaled(wait_any(&[h], 1, Some(Duration::ZERO), 0), 0));
         assert_eq!(
-            wait_any(&[h], 1, Some(Duration::from_millis(10))),
+            wait_any(&[h], 1, Some(Duration::from_millis(10)), 0),
             WaitOutcome::Timeout
         );
         assert_eq!(sem_release(h, 3).unwrap(), 0);
@@ -71,7 +71,7 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
             sem_release(h, 1).unwrap();
         });
-        assert!(is_signaled(wait_any(&[h], 1, None), 0));
+        assert!(is_signaled(wait_any(&[h], 1, None, 0), 0));
         t.join().unwrap();
         assert!(close(h));
     }
@@ -82,12 +82,12 @@ mod tests {
         let h = create_mutex(0, 0).unwrap();
         // Kernel: !owner != !count is invalid.
         assert_eq!(create_mutex(5, 0), Err(Error::Invalid));
-        assert!(is_signaled(wait_any(&[h], 7, Some(Duration::ZERO)), 0));
-        assert!(is_signaled(wait_any(&[h], 7, Some(Duration::ZERO)), 0));
+        assert!(is_signaled(wait_any(&[h], 7, Some(Duration::ZERO), 0), 0));
+        assert!(is_signaled(wait_any(&[h], 7, Some(Duration::ZERO), 0), 0));
         assert_eq!(read_mutex(h).unwrap(), (2, 7, false));
         // Not the owner: cannot wait or unlock.
         assert_eq!(
-            wait_any(&[h], 8, Some(Duration::from_millis(10))),
+            wait_any(&[h], 8, Some(Duration::from_millis(10)), 0),
             WaitOutcome::Timeout
         );
         assert_eq!(mutex_unlock(h, 8), Err(Error::Perm));
@@ -102,11 +102,11 @@ mod tests {
     fn mutex_abandoned() {
         setup();
         let h = create_mutex(0, 0).unwrap();
-        assert!(is_signaled(wait_any(&[h], 1, Some(Duration::ZERO)), 0));
+        assert!(is_signaled(wait_any(&[h], 1, Some(Duration::ZERO), 0), 0));
         assert_eq!(mutex_kill(h, 2), Err(Error::Perm));
         mutex_kill(h, 1).unwrap();
         assert_eq!(read_mutex(h).unwrap(), (0, 0, true));
-        match wait_any(&[h], 2, Some(Duration::ZERO)) {
+        match wait_any(&[h], 2, Some(Duration::ZERO), 0) {
             WaitOutcome::Signaled { index, owner_dead } => {
                 assert_eq!(index, 0);
                 assert!(owner_dead);
@@ -122,16 +122,16 @@ mod tests {
     fn event_auto_and_manual_reset() {
         setup();
         let auto = create_event(false, true).unwrap();
-        assert!(is_signaled(wait_any(&[auto], 1, Some(Duration::ZERO)), 0));
+        assert!(is_signaled(wait_any(&[auto], 1, Some(Duration::ZERO), 0), 0));
         // Auto-reset: consumed after wait.
         assert!(!read_event(auto).unwrap().1);
 
         let manual = create_event(true, true).unwrap();
-        assert!(is_signaled(wait_any(&[manual], 1, Some(Duration::ZERO)), 0));
-        assert!(is_signaled(wait_any(&[manual], 1, Some(Duration::ZERO)), 0));
+        assert!(is_signaled(wait_any(&[manual], 1, Some(Duration::ZERO), 0), 0));
+        assert!(is_signaled(wait_any(&[manual], 1, Some(Duration::ZERO), 0), 0));
         event_reset(manual).unwrap();
         assert_eq!(
-            wait_any(&[manual], 1, Some(Duration::from_millis(10))),
+            wait_any(&[manual], 1, Some(Duration::from_millis(10)), 0),
             WaitOutcome::Timeout
         );
         assert!(close(auto));
@@ -148,7 +148,7 @@ mod tests {
             let hits = hits.clone();
             threads.push(thread::spawn(move || {
                 if !matches!(
-                    wait_any(&[h], 10 + i, None),
+                    wait_any(&[h], 10 + i, None, 0),
                     WaitOutcome::Signaled { .. }
                 ) {
                     hits.store(false, Ordering::SeqCst);
@@ -171,11 +171,11 @@ mod tests {
         let sem = create_semaphore(1, 1).unwrap();
         let ev = create_event(true, false).unwrap();
         assert_eq!(
-            wait_all(&[sem, ev], 1, Some(Duration::from_millis(10))),
+            wait_all(&[sem, ev], 1, Some(Duration::from_millis(10)), 0),
             WaitOutcome::Timeout
         );
         event_set(ev).unwrap();
-        assert!(is_signaled(wait_all(&[sem, ev], 1, Some(Duration::ZERO)), 0));
+        assert!(is_signaled(wait_all(&[sem, ev], 1, Some(Duration::ZERO), 0), 0));
         assert_eq!(read_sem(sem).unwrap(), (0, 1));
         assert!(read_event(ev).unwrap().1); // manual event stays signaled
         assert!(close(sem));
@@ -187,7 +187,7 @@ mod tests {
         setup();
         let s1 = create_semaphore(0, 1).unwrap();
         let s2 = create_semaphore(1, 1).unwrap();
-        assert!(is_signaled(wait_any(&[s1, s2], 1, Some(Duration::ZERO)), 1));
+        assert!(is_signaled(wait_any(&[s1, s2], 1, Some(Duration::ZERO), 0), 1));
         assert!(close(s1));
         assert!(close(s2));
     }
@@ -196,11 +196,11 @@ mod tests {
     fn invalid_handles() {
         setup();
         assert_eq!(
-            wait_any(&[0xDEADBEEF], 1, Some(Duration::ZERO)),
+            wait_any(&[0xDEADBEEF], 1, Some(Duration::ZERO), 0),
             WaitOutcome::Invalid
         );
-        assert_eq!(wait_any(&[], 1, None), WaitOutcome::Invalid);
-        assert_eq!(wait_any(&[1], 0, None), WaitOutcome::Invalid);
+        assert_eq!(wait_any(&[], 1, None, 0), WaitOutcome::Invalid);
+        assert_eq!(wait_any(&[1], 0, None, 0), WaitOutcome::Invalid);
         assert_eq!(sem_release(0xDEADBEEF, 1), Err(Error::Invalid));
         assert_eq!(event_set(0xDEADBEEF), Err(Error::Invalid));
         assert!(!close(0xDEADBEEF));
@@ -214,7 +214,7 @@ mod tests {
         if pid == 0 {
             // Child: block until the parent releases.
             let ok = matches!(
-                wait_any(&[h], 42, None),
+                wait_any(&[h], 42, None, 0),
                 WaitOutcome::Signaled { index: 0, .. }
             );
             std::process::exit(if ok { 0 } else { 1 });
