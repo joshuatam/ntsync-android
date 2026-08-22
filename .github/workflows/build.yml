@@ -32,8 +32,9 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target.triple }}
 
       - name: Resolve Android NDK path
         run: |
@@ -45,20 +46,20 @@ jobs:
 
       - name: Build libntsync_android.so
         run: |
-          export "CARGO_TARGET_$(echo ${{ matrix.target }} | tr 'a-z-' 'A-Z_')_LINKER=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.clang }}${{ env.API_LEVEL }}-clang"
+          export "CARGO_TARGET_$(echo ${{ matrix.target.triple }} | tr 'a-z-' 'A-Z_')_LINKER=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target.clang }}${{ env.API_LEVEL }}-clang"
           export AR="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target.triple }}
 
       - name: Verify 16KB page-size alignment
         run: |
-          SO=target/${{ matrix.target }}/release/libntsync_android.so
+          SO=target/${{ matrix.target.triple }}/release/libntsync_android.so
           readelf -lW "$SO" | grep LOAD
           readelf -lW "$SO" | grep LOAD | awk '{print $NF}' | grep -qx 0x4000
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libntsync_android-${{ matrix.abi }}
+          name: libntsync_android-${{ matrix.target.abi }}
           path: |
-            target/${{ matrix.target }}/release/libntsync_android.so
+            target/${{ matrix.target.triple }}/release/libntsync_android.so
             include/ntsync_user.h
