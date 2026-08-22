@@ -279,29 +279,47 @@ pub unsafe extern "C" fn ntsync_mutex_read(handle: u32, args: *mut ntsync_mutex_
     }
 }
 
-/// NTSYNC_IOC_EVENT_SET
+/// NTSYNC_IOC_EVENT_SET. On success stores the previous state in *prev (if
+/// non-NULL), like the kernel ioctl.
 #[no_mangle]
-pub extern "C" fn ntsync_event_set(handle: u32) -> i32 {
+pub unsafe extern "C" fn ntsync_event_set(handle: u32, prev: *mut u32) -> i32 {
     match core::event_set(handle) {
-        Ok(()) => 0,
+        Ok(p) => {
+            if let Some(prev) = unsafe { prev.as_mut() } {
+                *prev = p;
+            }
+            0
+        }
         Err(e) => errno(e),
     }
 }
 
-/// NTSYNC_IOC_EVENT_RESET
+/// NTSYNC_IOC_EVENT_RESET. On success stores the previous state in *prev (if
+/// non-NULL), like the kernel ioctl.
 #[no_mangle]
-pub extern "C" fn ntsync_event_reset(handle: u32) -> i32 {
+pub unsafe extern "C" fn ntsync_event_reset(handle: u32, prev: *mut u32) -> i32 {
     match core::event_reset(handle) {
-        Ok(()) => 0,
+        Ok(p) => {
+            if let Some(prev) = unsafe { prev.as_mut() } {
+                *prev = p;
+            }
+            0
+        }
         Err(e) => errno(e),
     }
 }
 
-/// NTSYNC_IOC_EVENT_PULSE
+/// NTSYNC_IOC_EVENT_PULSE. On success stores the previous state in *prev (if
+/// non-NULL), like the kernel ioctl.
 #[no_mangle]
-pub extern "C" fn ntsync_event_pulse(handle: u32) -> i32 {
+pub unsafe extern "C" fn ntsync_event_pulse(handle: u32, prev: *mut u32) -> i32 {
     match core::event_pulse(handle) {
-        Ok(()) => 0,
+        Ok(p) => {
+            if let Some(prev) = unsafe { prev.as_mut() } {
+                *prev = p;
+            }
+            0
+        }
         Err(e) => errno(e),
     }
 }

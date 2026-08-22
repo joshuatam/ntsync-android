@@ -75,6 +75,12 @@ struct ntsync_wait_args {
 
 #define NTSYNC_MAX_WAIT_COUNT 64
 
+/* Wine integration: wineserver reports userspace ntsync to clients by
+ * putting this sentinel in the inproc_device field of the init_first_thread
+ * reply, and passes object handles in the fsync_shm_idx reply field instead
+ * of SCM_RIGHTS fd passing. */
+#define NTSYNC_ANDROID_USED_BY_SERVER 0x7eadfe01
+
 /* Initialize the shared region. `path` may be NULL to use
  * $TMPDIR/ntsync_userspace.shm (the caller must export TMPDIR).
  * Idempotent; all other functions auto-initialize on first use. */
@@ -105,10 +111,11 @@ int32_t ntsync_mutex_unlock(uint32_t handle, struct ntsync_mutex_args *args);
 int32_t ntsync_mutex_kill(uint32_t handle, uint32_t owner);
 int32_t ntsync_mutex_read(uint32_t handle, struct ntsync_mutex_args *args);
 
-/* Events. */
-int32_t ntsync_event_set(uint32_t handle);
-int32_t ntsync_event_reset(uint32_t handle);
-int32_t ntsync_event_pulse(uint32_t handle);
+/* Events. On success, set/reset/pulse store the previous signaled state in
+ * *prev (if non-NULL), like the kernel ioctls. */
+int32_t ntsync_event_set(uint32_t handle, uint32_t *prev);
+int32_t ntsync_event_reset(uint32_t handle, uint32_t *prev);
+int32_t ntsync_event_pulse(uint32_t handle, uint32_t *prev);
 int32_t ntsync_event_read(uint32_t handle, struct ntsync_event_args *args);
 
 /* Waits. Return 0 and set args->index on success, -EOWNERDEAD (and set

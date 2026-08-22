@@ -431,39 +431,45 @@ pub fn sem_release(handle: u32, count: u32) -> Result<u32, Error> {
     }
 }
 
-pub fn event_set(handle: u32) -> Result<(), Error> {
+pub fn event_set(handle: u32) -> Result<u32, Error> {
     let r = region()?;
     let _g = r.lock_guard().map_err(Error::Init)?;
     let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_EVENT).ok_or(Error::Invalid)?;
-    unsafe {
+    let prev = unsafe {
+        let prev = (*slot).a;
         (*slot).a = 1;
-    }
+        prev
+    };
     r.bump_and_wake();
-    Ok(())
+    Ok(prev)
 }
 
-pub fn event_reset(handle: u32) -> Result<(), Error> {
+pub fn event_reset(handle: u32) -> Result<u32, Error> {
     let r = region()?;
     let _g = r.lock_guard().map_err(Error::Init)?;
     let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_EVENT).ok_or(Error::Invalid)?;
-    unsafe {
+    let prev = unsafe {
+        let prev = (*slot).a;
         (*slot).a = 0;
-    }
+        prev
+    };
     r.bump_and_wake();
-    Ok(())
+    Ok(prev)
 }
 
-pub fn event_pulse(handle: u32) -> Result<(), Error> {
+pub fn event_pulse(handle: u32) -> Result<u32, Error> {
     let r = region()?;
     let _g = r.lock_guard().map_err(Error::Init)?;
     let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_EVENT).ok_or(Error::Invalid)?;
-    unsafe {
+    let prev = unsafe {
+        let prev = (*slot).a;
         // Wake all current waiters, then return to unsignaled.
         (*slot).d = (*slot).d.wrapping_add(1);
         (*slot).a = 0;
-    }
+        prev
+    };
     r.bump_and_wake();
-    Ok(())
+    Ok(prev)
 }
 
 /// Unlock a mutex held by `owner`. Returns the previous recursion count.
