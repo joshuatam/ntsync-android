@@ -633,15 +633,19 @@ fn try_acquire(slot: &mut Slot, owner: u32, entry_seq: u64) -> Option<bool> {
     }
 }
 
-pub fn wait_any(handles: &[u32], owner: u32, timeout: Option<Duration>) -> WaitOutcome {
-    wait(handles, owner, timeout, false)
+/// `alert` is the optional alertable-wait event handle (0 = none), matching
+/// the kernel's ntsync_wait_args.alert: if it is (or becomes) signaled, the
+/// wait completes with index == handles.len(). The alert event is only
+/// tested, never acquired (wineserver resets it when the APC queue empties).
+pub fn wait_any(handles: &[u32], owner: u32, timeout: Option<Duration>, alert: u32) -> WaitOutcome {
+    wait(handles, owner, timeout, false, alert)
 }
 
-pub fn wait_all(handles: &[u32], owner: u32, timeout: Option<Duration>) -> WaitOutcome {
-    wait(handles, owner, timeout, true)
+pub fn wait_all(handles: &[u32], owner: u32, timeout: Option<Duration>, alert: u32) -> WaitOutcome {
+    wait(handles, owner, timeout, true, alert)
 }
 
-fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool) -> WaitOutcome {
+fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert: u32) -> WaitOutcome {
     if owner == 0
         || handles.is_empty()
         || handles.len() > MAX_WAIT_COUNT
@@ -652,6 +656,20 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool) -> Wa
     let Ok(r) = region() else {
         return WaitOutcome::Invalid;
     };
+
+    // Validate the alert event handle up front.
+    if alert != 0 {
+        let Ok(_g) = r.lock_guard() else {
+            return WaitOutcome::Invalid;
+        };
+        let valid = match r.slot(alert) {
+            Some(slot) => unsafe { (*slot).obj_type == TYPE_EVENT },
+            None => false,
+        };
+        if !valid {
+            return WaitOutcome::Invalid;
+        }
+    }
 
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
 
@@ -683,6 +701,19 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool) -> Wa
             // Re-validate: objects may have been closed while waiting.
             if handles.iter().any(|h| r.slot(*h).is_none()) {
                 return WaitOutcome::Invalid;
+            }
+
+            // Alertable wait: the alert event wins immediately if signaled.
+            if alert != 0 {
+                let Some(slot) = r.slot(alert) else {
+                    return WaitOutcome::Invalid;
+                };
+                if unsafe { (*slot).a != 0 } {
+                    return WaitOutcome::Signaled {
+                        index: handles.len() as u32,
+                        owner_dead: false,
+                    };
+                }
             }
 
             if !all {

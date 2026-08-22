@@ -6,7 +6,9 @@
 //! in place of kernel fds. All functions return 0 on success or a negative
 //! errno, exactly like the kernel ioctls.
 //!
-//! Not implemented: the alertable-wait event (`alert` field must be 0).
+//! Alertable waits: if `alert` is nonzero it names an event object that
+//! aborts the wait; the wait then returns success with `index == count`,
+//! exactly like the kernel ioctls.
 
 use std::ffi::CStr;
 use std::time::Duration;
@@ -57,7 +59,7 @@ pub struct ntsync_wait_args {
     pub flags: u32,
     /// In: owner tid used to acquire mutexes.
     pub owner: u32,
-    /// Unsupported; must be 0.
+    /// In: optional alert event handle (0 = none).
     pub alert: u32,
     pub pad: u32,
 }
@@ -89,9 +91,9 @@ fn timeout_to_duration(timeout: u64, flags: u32) -> Option<Duration> {
     Some(Duration::from_nanos(timeout.saturating_sub(now)))
 }
 
-unsafe fn read_wait(args: *const ntsync_wait_args) -> Result<(Vec<u32>, u32, Option<Duration>), i32> {
+unsafe fn read_wait(args: *const ntsync_wait_args) -> Result<(Vec<u32>, u32, u32, Option<Duration>), i32> {
     let args = unsafe { args.as_ref() }.ok_or(-EFAULT)?;
-    if args.count == 0 || args.count > NTSYNC_MAX_WAIT_COUNT || args.alert != 0 {
+    if args.count == 0 || args.count > NTSYNC_MAX_WAIT_COUNT {
         return Err(-EINVAL);
     }
     let objs = args.objs as *const u32;
@@ -101,7 +103,7 @@ unsafe fn read_wait(args: *const ntsync_wait_args) -> Result<(Vec<u32>, u32, Opt
     let handles: Vec<u32> =
         unsafe { std::slice::from_raw_parts(objs, args.count as usize) }.to_vec();
     let timeout = timeout_to_duration(args.timeout, args.flags);
-    Ok((handles, args.owner, timeout))
+    Ok((handles, args.owner, args.alert, timeout))
 }
 
 /// Initialize the shared region. `path` may be NULL to use
@@ -347,14 +349,14 @@ unsafe fn do_wait(args: *mut ntsync_wait_args, all: bool) -> i32 {
     if args.is_null() {
         return -EFAULT;
     }
-    let (handles, owner, timeout) = match unsafe { read_wait(args) } {
+    let (handles, owner, alert, timeout) = match unsafe { read_wait(args) } {
         Ok(v) => v,
         Err(e) => return e,
     };
     let outcome = if all {
-        core::wait_all(&handles, owner, timeout)
+        core::wait_all(&handles, owner, timeout, alert)
     } else {
-        core::wait_any(&handles, owner, timeout)
+        core::wait_any(&handles, owner, timeout, alert)
     };
     match outcome {
         WaitOutcome::Signaled { index, owner_dead } => {
