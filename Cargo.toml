@@ -1,0 +1,13 @@
+[package]
+name = "ntsync-android"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-3.0-only"
+authors = ["Joshua Tam <297250+joshuatam@users.noreply.github.com>"]
+
+[lib]
+name = "ntsync_android"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc = "0.2"
