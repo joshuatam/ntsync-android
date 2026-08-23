@@ -692,18 +692,9 @@ fn try_acquire(slot: &mut Slot, owner: u32, entry_seq: u64) -> Option<bool> {
 /// the kernel's ntsync_wait_args.alert: if it is (or becomes) signaled, the
 /// wait completes with index == handles.len(). The alert event is only
 /// tested, never acquired (wineserver resets it when the APC queue empties).
-/// Log to logcat (liblog is linked into ntdll.so/wineserver) and stderr.
+/// Log to stderr (kept dependency-free so ntdll.so/wineserver do not need liblog).
 fn debug_log(msg: &str) {
     eprintln!("{msg}");
-    #[cfg(target_os = "android")]
-    unsafe {
-        __android_log_write(4, c"ntsync".as_ptr(), std::ffi::CString::new(msg).unwrap_or_default().as_ptr());
-    }
-}
-
-#[cfg(target_os = "android")]
-unsafe extern "C" {
-    fn __android_log_write(prio: i32, tag: *const libc::c_char, text: *const libc::c_char) -> i32;
 }
 
 fn debug_enabled() -> bool {
