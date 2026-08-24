@@ -40,7 +40,7 @@ use std::time::Duration;
 pub const MAX_WAIT_COUNT: usize = 64;
 
 const MAGIC: u64 = 0x6E7473796E635F75; // "ntsyc_u"
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 const SLOT_COUNT: u32 = 16384;
 const NODE_COUNT: u32 = 8192;
 const INDEX_BITS: u32 = 14; // log2(SLOT_COUNT)
@@ -48,7 +48,8 @@ const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
 const NIL: u32 = u32::MAX;
 
 /// Resolve the region path: explicit argument, else $NTSYNC_SHM, else
-/// $TMPDIR/ntsync_userspace.shm. NTSYNC_SHM exists because in containerized
+/// $TMPDIR/ntsync_userspace.shm (a ".vN" layout-version suffix is appended).
+/// NTSYNC_SHM exists because in containerized
 /// setups (e.g. GameNative) wineserver and game processes run with different
 /// TMPDIRs and would otherwise mmap different files and never share objects.
 fn resolve_path(path: Option<&str>) -> Result<String, i32> {
@@ -134,6 +135,17 @@ struct WaitNode {
     obj_next: u32,
     waiter_next: u32,   // next node of the same waiter / free-list link
     pid: u32,           // owner pid, for ntsync_sweep_dead purging
+    /// CLOCK_MONOTONIC ns when the head node was last woken (diagnostics;
+    /// written by the waker before bumping `seq`, read by the waiter after
+    /// futex wake while it still owns the node).
+    wake_ts: std::sync::atomic::AtomicU64,
+}
+
+/// CLOCK_MONOTONIC in nanoseconds.
+fn monotonic_ns() -> u64 {
+    let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 const NODE_SIZE: usize = std::mem::size_of::<WaitNode>();
@@ -515,6 +527,7 @@ fn wake_object(r: &Region, obj_idx: u32) {
         node_detach(r, idx);
         let head = r.node_ptr(word);
         unsafe {
+            (*head).wake_ts.store(monotonic_ns(), Ordering::Relaxed);
             (*head).seq.fetch_add(1, Ordering::Release);
             futex_wake(&(*head).seq);
         }
@@ -542,110 +555,125 @@ fn current_tid() -> u32 {
 }
 
 fn open_and_map(path: &str) -> Result<Region, i32> {
+    // Distinct library layouts never share a region file: the version suffix
+    // keeps stale files from older builds out of the way. A leftover file
+    // with the wrong size/version is unlinked and recreated, never truncated
+    // or zeroed in place - in-place mutation would SIGBUS/corrupt any process
+    // that still has it mapped (e.g. a wineserver from an older build sharing
+    // the path during a version transition).
+    let path = format!("{path}.v{VERSION}");
     if debug_enabled() {
         debug_log(&format!("ntsync shm path: {path} (pid {})", std::process::id()));
     }
     let c_path = CString::new(path).map_err(|_| libc::EINVAL)?;
-    unsafe {
-        let fd = libc::open(
-            c_path.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
-            0o600,
-        );
-        if fd < 0 {
-            return Err(errno());
-        }
-        // Serialize initialization across processes.
-        if libc::flock(fd, libc::LOCK_EX) != 0 {
-            let e = errno();
-            libc::close(fd);
-            return Err(e);
-        }
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut st) != 0 {
-            let e = errno();
-            libc::close(fd);
-            return Err(e);
-        }
-        let mut need_init = st.st_size == 0;
-        if !need_init && st.st_size != region_size() as i64 {
-            // Stale file from an older layout; recreate it (flock held).
-            if libc::ftruncate(fd, 0) != 0 {
-                let e = errno();
-                libc::close(fd);
-                return Err(e);
+    for _ in 0..4 {
+        match unsafe { try_open_and_map(&c_path) } {
+            Ok(region) => return Ok(region),
+            Err(libc::ESTALE) => unsafe {
+                // Stale or corrupt file; remove it (processes that still have
+                // it mapped keep their ghost inode, unharmed) and retry.
+                libc::unlink(c_path.as_ptr());
             }
-            need_init = true;
+            Err(e) => return Err(e),
         }
-        if need_init && libc::ftruncate(fd, region_size() as _) != 0 {
-            let e = errno();
-            libc::close(fd);
-            return Err(e);
-        }
-        let base = libc::mmap(
-            std::ptr::null_mut(),
-            region_size(),
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        );
-        if base == libc::MAP_FAILED {
-            let e = errno();
-            libc::flock(fd, libc::LOCK_UN);
-            libc::close(fd);
-            return Err(e);
-        }
-        let region = Region { base: base as *mut u8 };
-        if !need_init && region.header().magic == MAGIC && region.header().version != VERSION {
-            // Region left behind by an older library version; all live
-            // processes use this same library, so reinitialize in place
-            // (flock still held, no other process can be initializing).
-            need_init = true;
-        }
-        if need_init {
-            std::ptr::write_bytes(base, 0, region_size());
-            let header = &mut *(base as *mut Header);
-            let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
-            libc::pthread_mutexattr_init(&mut attr);
-            libc::pthread_mutexattr_setpshared(&mut attr, PTHREAD_PROCESS_SHARED);
-            pthread_mutexattr_setrobust(&mut attr, PTHREAD_MUTEX_ROBUST);
-            libc::pthread_mutex_init(&mut header.lock, &attr);
-            libc::pthread_mutexattr_destroy(&mut attr);
-            header.magic = MAGIC;
-            header.version = VERSION;
-            header.capacity = SLOT_COUNT;
-            header.node_capacity = NODE_COUNT;
-            header.node_free_head = 0;
-            header.next_scan = 0;
-            for i in 0..NODE_COUNT {
-                let node = &mut *region.node_ptr(i);
-                node.waiter_next = if i + 1 < NODE_COUNT { i + 1 } else { NIL };
-                node.registered = 0;
-                node.obj = NIL;
-                node.wait_word = NIL;
-                node.obj_prev = NIL;
-                node.obj_next = NIL;
-            }
-        } else if region.header().magic != MAGIC
-            || region.header().capacity != SLOT_COUNT
-            || region.header().node_capacity != NODE_COUNT
-        {
-            libc::flock(fd, libc::LOCK_UN);
-            libc::close(fd);
-            libc::munmap(base, region_size());
-            return Err(libc::EINVAL);
-        }
+    }
+    Err(libc::ESTALE)
+}
+
+/// Returns ESTALE when the existing file does not match this library's
+/// layout; the caller then unlinks and retries.
+unsafe fn try_open_and_map(c_path: &CString) -> Result<Region, i32> {
+    let fd = libc::open(
+        c_path.as_ptr(),
+        libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+        0o600,
+    );
+    if fd < 0 {
+        return Err(errno());
+    }
+    // Serialize initialization across processes.
+    if libc::flock(fd, libc::LOCK_EX) != 0 {
+        let e = errno();
+        libc::close(fd);
+        return Err(e);
+    }
+    let mut st: libc::stat = std::mem::zeroed();
+    if libc::fstat(fd, &mut st) != 0 {
+        let e = errno();
         libc::flock(fd, libc::LOCK_UN);
         libc::close(fd);
-        Ok(region)
+        return Err(e);
     }
+    if st.st_size != 0 && st.st_size != region_size() as i64 {
+        libc::flock(fd, libc::LOCK_UN);
+        libc::close(fd);
+        return Err(libc::ESTALE);
+    }
+    let need_init = st.st_size == 0;
+    if need_init && libc::ftruncate(fd, region_size() as _) != 0 {
+        let e = errno();
+        libc::flock(fd, libc::LOCK_UN);
+        libc::close(fd);
+        return Err(e);
+    }
+    let base = libc::mmap(
+        std::ptr::null_mut(),
+        region_size(),
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED,
+        fd,
+        0,
+    );
+    if base == libc::MAP_FAILED {
+        let e = errno();
+        libc::flock(fd, libc::LOCK_UN);
+        libc::close(fd);
+        return Err(e);
+    }
+    let region = Region { base: base as *mut u8 };
+    if need_init {
+        std::ptr::write_bytes(base, 0, region_size());
+        let header = &mut *(base as *mut Header);
+        let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
+        libc::pthread_mutexattr_init(&mut attr);
+        libc::pthread_mutexattr_setpshared(&mut attr, PTHREAD_PROCESS_SHARED);
+        pthread_mutexattr_setrobust(&mut attr, PTHREAD_MUTEX_ROBUST);
+        libc::pthread_mutex_init(&mut header.lock, &attr);
+        libc::pthread_mutexattr_destroy(&mut attr);
+        header.magic = MAGIC;
+        header.version = VERSION;
+        header.capacity = SLOT_COUNT;
+        header.node_capacity = NODE_COUNT;
+        header.node_free_head = 0;
+        header.next_scan = 0;
+        for i in 0..NODE_COUNT {
+            let node = &mut *region.node_ptr(i);
+            node.waiter_next = if i + 1 < NODE_COUNT { i + 1 } else { NIL };
+            node.registered = 0;
+            node.obj = NIL;
+            node.wait_word = NIL;
+            node.obj_prev = NIL;
+            node.obj_next = NIL;
+        }
+    } else if region.header().magic != MAGIC
+        || region.header().version != VERSION
+        || region.header().capacity != SLOT_COUNT
+        || region.header().node_capacity != NODE_COUNT
+    {
+        libc::munmap(base, region_size());
+        libc::flock(fd, libc::LOCK_UN);
+        libc::close(fd);
+        return Err(libc::ESTALE);
+    }
+    libc::flock(fd, libc::LOCK_UN);
+    libc::close(fd);
+    Ok(region)
 }
 
 static REGION: OnceLock<Result<Region, i32>> = OnceLock::new();
 
 /// Initialize (idempotently) with the shared-memory file at `path`.
-/// Called automatically with $TMPDIR/ntsync_userspace.shm if the library
+/// Called automatically with $TMPDIR/ntsync_userspace.shm.vN if the library
 /// is used without an explicit init.
 pub fn init(path: Option<&str>) -> Result<(), Error> {
     debug_enabled(); // read NTSYNC_DEBUG and arm the watchdog/stats at startup
@@ -1060,7 +1088,7 @@ fn debug_log(msg: &str) {
 mod stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    pub const NAMES: [&str; 10] = [
+    pub const NAMES: [&str; 13] = [
         "wait_calls",        // total wait_any/wait_all calls
         "wait_fast_ok",      // satisfied without any lock
         "wait_blocked",      // actually slept on a futex
@@ -1071,11 +1099,15 @@ mod stats {
         "signal_ops",        // release/set/unlock/... calls
         "wake_walks",        // times a signal op found waiters and locked
         "nodes_registered",  // waiter-node registrations
+        "wake_lat_cnt",      // wakes with a timestamp sample
+        "wake_lat_us_sum",   // total wake latency (signal -> waiter running), us
+        "wake_lat_us_max",   // worst wake latency, us
     ];
-    pub static COUNTERS: [AtomicU64; 10] = [
+    pub static COUNTERS: [AtomicU64; 13] = [
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0),
     ];
 
     #[inline]
@@ -1420,6 +1452,17 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
 
         stat_bump(3); // futex_sleeps
         let ret = futex_wait(unsafe { &(*r.node_ptr(head)).seq }, seq, slice);
+        if ret == 0 {
+            // Woken by a signaler: measure signal-to-running latency.
+            let head_node = unsafe { &*r.node_ptr(head) };
+            let ts = head_node.wake_ts.load(Ordering::Relaxed);
+            if ts != 0 {
+                let lat_us = monotonic_ns().saturating_sub(ts) / 1000;
+                stat_bump(10); // wake_lat_cnt
+                stat_add(11, lat_us); // wake_lat_us_sum
+                stats::COUNTERS[12].fetch_max(lat_us, Ordering::Relaxed); // wake_lat_us_max
+            }
+        }
         match ret {
             0 | libc::EAGAIN => {}
             x if x == libc::ETIMEDOUT => {
