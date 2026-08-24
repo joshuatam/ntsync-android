@@ -4,41 +4,61 @@
 //! Userspace reimplementation of the Linux ntsync driver semantics
 //! (drivers/misc/ntsync.c): NT semaphores, mutexes, and events.
 //!
-//! Cross-process design using Android/Linux NDK primitives:
+//! Cross-process design using Android/Linux NDK primitives, tuned for
+//! Proton/Wine workloads where dozens of threads hammer sync objects:
 //!
 //! - All objects live in a fixed-size table in a file-backed shared mapping
 //!   (opened by every process at the same path), mirroring the kernel's
 //!   global object table.
-//! - A process-shared *robust* pthread mutex in the shared page serializes
-//!   all state changes and wait check/commit cycles, mirroring the kernel's
-//!   dev->wait_all_lock. If a process dies holding it, the next locker gets
-//!   EOWNERDEAD and marks it consistent.
-//! - Waiters block with futex(FUTEX_WAIT) on a global generation counter
-//!   that is bumped (and FUTEX_WAKE'd) by every state change, mirroring the
-//!   kernel's wake-then-recheck loop in try_wake_any_obj/try_wake_all.
+//! - Each object's mutable state is packed into a single atomic u64, so
+//!   try-acquires and signal operations (sem_release, event_set/reset,
+//!   mutex_unlock, ...) are lock-free single-word CAS loops. Satisfied
+//!   waits complete without taking any lock.
+//! - A process-shared *robust* pthread mutex serializes only waiter-list
+//!   registration and wake walks (and creation/close). If a process dies
+//!   holding it, the next locker gets EOWNERDEAD and marks it consistent.
+//! - Wakeups are per-object like the kernel's wait queues: each object keeps
+//!   an intrusive list of registered waiters, and each waiter sleeps with
+//!   futex(FUTEX_WAIT) on its own word in the shared waiter pool. A state
+//!   change walks only that object's list (mirroring wake_up(&obj->q) +
+//!   try_wake_any_obj/try_wake_all re-check). Registration and wake walks
+//!   both happen under the region lock, and waiters re-check under it
+//!   before sleeping, so no wakeup can be missed.
 //!
 //! Divergences from the kernel: closing an object that other threads are
 //! waiting on fails those waits with EINVAL (the kernel keeps the object
-//! alive via fd references); alertable waits are not supported; object
-//! cleanup after a process crash requires ntsync_sweep_dead().
+//! alive via fd references); WAIT_ALL acquisition is a per-object CAS
+//! sequence with rollback rather than a single atomic commit under
+//! wait_all_lock; object cleanup after a process crash requires
+//! ntsync_sweep_dead().
 
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 pub const MAX_WAIT_COUNT: usize = 64;
 
 const MAGIC: u64 = 0x6E7473796E635F75; // "ntsyc_u"
-const VERSION: u32 = 2;
+const VERSION: u32 = 5;
 const SLOT_COUNT: u32 = 16384;
+const NODE_COUNT: u32 = 8192;
 const INDEX_BITS: u32 = 14; // log2(SLOT_COUNT)
 const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
-/// Resolve the region path: explicit argument, else $TMPDIR/ntsync_userspace.shm.
-/// The caller is expected to export TMPDIR (Termux and app sandboxes do).
+const NIL: u32 = u32::MAX;
+
+/// Resolve the region path: explicit argument, else $NTSYNC_SHM, else
+/// $TMPDIR/ntsync_userspace.shm. NTSYNC_SHM exists because in containerized
+/// setups (e.g. GameNative) wineserver and game processes run with different
+/// TMPDIRs and would otherwise mmap different files and never share objects.
 fn resolve_path(path: Option<&str>) -> Result<String, i32> {
     if let Some(p) = path {
         return Ok(p.into());
+    }
+    if let Ok(shm) = std::env::var("NTSYNC_SHM") {
+        if !shm.is_empty() {
+            return Ok(shm);
+        }
     }
     match std::env::var("TMPDIR") {
         Ok(tmp) if !tmp.is_empty() => Ok(format!("{tmp}/ntsync_userspace.shm")),
@@ -76,8 +96,14 @@ pub enum WaitOutcome {
     Invalid,
 }
 
-/// One object slot in the shared table. All fields are plain u32/u64 and
-/// are only accessed under the region lock, except during futex waits.
+/// One object slot in the shared table. `state`/`generation`/`obj_type`/`pid`
+/// change only under the region lock; `w0` and `d` are accessed atomically
+/// at all times (lock-free on the hot paths).
+///
+/// w0 packing by type:
+///   sem:   hi32 = max,    lo32 = count
+///   mutex: hi32 = count (31 bits) | ownerdead<<31, lo32 = owner
+///   event: hi32 = manual, lo32 = signaled
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Slot {
@@ -85,30 +111,49 @@ struct Slot {
     generation: u32,
     obj_type: u32,  // TYPE_*
     pid: u32,       // creator pid, for ntsync_sweep_dead
-    a: u32,         // sem: count   | mutex: count   | event: signaled
-    b: u32,         // sem: max     | mutex: owner   | event: manual
-    c: u32,         // mutex: ownerdead
-    d: u64,         // event: pulse_seq
+    waiter_head: u32, // head of the per-object waiter list (node index, NIL)
+    _pad: u32,
+    w0: u64,        // packed object state (atomic)
+    d: u64,         // event: pulse_seq (atomic)
 }
 
 const SLOT_SIZE: usize = std::mem::size_of::<Slot>();
+
+/// One waiter node in the shared pool. A thread waiting on N objects
+/// allocates N nodes and registers one on each object's waiter list;
+/// it sleeps on nodes[0].seq ("head node"). Signalers detach the node
+/// from their object's list, bump the head node's seq, and FUTEX_WAKE it.
+/// Accessed only under the region lock, except `seq` during futex waits.
+#[repr(C)]
+struct WaitNode {
+    seq: AtomicU32,     // futex word (only the head node's is waited on)
+    registered: u32,    // 1 while linked on `obj`'s waiter list
+    obj: u32,           // object slot index this node is registered on
+    wait_word: u32,     // head node index whose `seq` is the futex word
+    obj_prev: u32,      // per-object list links (doubly linked, O(1) detach)
+    obj_next: u32,
+    waiter_next: u32,   // next node of the same waiter / free-list link
+    pid: u32,           // owner pid, for ntsync_sweep_dead purging
+}
+
+const NODE_SIZE: usize = std::mem::size_of::<WaitNode>();
 
 #[repr(C)]
 struct Header {
     magic: u64,
     version: u32,
     capacity: u32,
-    /// Futex word: bumped on every state change.
-    global_seq: AtomicU32,
+    node_capacity: u32,
+    /// Free-list head for the waiter node pool (linked via waiter_next).
+    node_free_head: u32,
     /// Allocation cursor.
     next_scan: u32,
     /// Debug: which thread currently holds `lock` (0 = none). Written after
     /// acquiring, cleared before releasing; only meaningful while locked.
     lock_owner_pid: u32,
     lock_owner_tid: u32,
-    _pad: [u32; 1],
     lock: libc::pthread_mutex_t,
-    // Slot array follows immediately.
+    // Slot array follows immediately, then the waiter node pool.
 }
 
 const HEADER_SIZE: usize = std::mem::size_of::<Header>();
@@ -180,8 +225,55 @@ fn errno() -> i32 {
     }
 }
 
-fn region_size() -> usize {
+// Lock-free accessors for the packed per-object state words.
+#[inline]
+fn ld32(p: &u32) -> u32 {
+    unsafe { (&*(p as *const u32 as *const AtomicU32)).load(Ordering::Acquire) }
+}
+#[inline]
+fn ld64(p: &u64) -> u64 {
+    unsafe { (&*(p as *const u64 as *const AtomicU64)).load(Ordering::Acquire) }
+}
+#[inline]
+fn st64(p: &u64, v: u64) {
+    unsafe { (&*(p as *const u64 as *const AtomicU64)).store(v, Ordering::Release) }
+}
+#[inline]
+fn cas64(p: &u64, old: u64, new: u64) -> Result<u64, u64> {
+    let r = unsafe {
+        (&*(p as *const u64 as *const AtomicU64)).compare_exchange(
+            old,
+            new,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+    };
+    if r.is_err() {
+        stat_bump(6); // cas_retries
+    }
+    r
+}
+
+// w0 packing helpers.
+#[inline]
+fn pack_sem(count: u32, max: u32) -> u64 {
+    ((max as u64) << 32) | count as u64
+}
+#[inline]
+fn pack_mutex(owner: u32, count: u32, ownerdead: bool) -> u64 {
+    (((count as u64) & 0x7fff_ffff) | ((ownerdead as u64) << 31)) << 32 | owner as u64
+}
+#[inline]
+fn pack_event(signaled: bool, manual: bool) -> u64 {
+    ((manual as u64) << 32) | signaled as u64
+}
+
+fn nodes_offset() -> usize {
     HEADER_SIZE + SLOT_COUNT as usize * SLOT_SIZE
+}
+
+fn region_size() -> usize {
+    nodes_offset() + NODE_COUNT as usize * NODE_SIZE
 }
 
 struct Region {
@@ -200,7 +292,13 @@ impl Region {
         unsafe { self.base.add(HEADER_SIZE + index as usize * SLOT_SIZE) as *mut Slot }
     }
 
+    fn node_ptr(&self, index: u32) -> *mut WaitNode {
+        unsafe { self.base.add(nodes_offset() + index as usize * NODE_SIZE) as *mut WaitNode }
+    }
+
     /// Get a used slot matching a handle's index+generation.
+    /// Lock-free safe: state/generation only change under the region lock
+    /// and are read here with acquire loads.
     fn slot(&self, handle: u32) -> Option<*mut Slot> {
         let index = handle & INDEX_MASK;
         let generation = handle >> INDEX_BITS;
@@ -209,7 +307,7 @@ impl Region {
         }
         let slot = self.slot_ptr(index);
         let s = unsafe { &*slot };
-        if s.state == SLOT_USED && s.generation == generation {
+        if ld32(&s.state) == SLOT_USED && ld32(&s.generation) == generation {
             Some(slot)
         } else {
             None
@@ -230,7 +328,9 @@ impl Region {
             libc::sigaddset(&mut block, libc::SIGUSR1);
             libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old_mask);
         }
+        let mut tries = 0u32;
         loop {
+            tries += 1;
             let ret = if debug {
                 // Poll with a timeout so a stuck holder can be logged.
                 let mut ts = unsafe { std::mem::zeroed::<libc::timespec>() };
@@ -241,6 +341,10 @@ impl Region {
                 unsafe { libc::pthread_mutex_lock(lock) }
             };
             if ret == 0 || ret == libc::EOWNERDEAD {
+                stat_bump(4); // lock_acq
+                if tries > 1 {
+                    stat_bump(5); // lock_contended
+                }
                 if ret == libc::EOWNERDEAD {
                     // Previous holder died mid-operation; the object states are
                     // still structurally valid because every op is a small,
@@ -275,42 +379,6 @@ impl Region {
             }
         }
     }
-
-    fn bump_and_wake(&self) {
-        // Caller holds the lock.
-        self.header().global_seq.fetch_add(1, Ordering::Release);
-        let addr = &self.header().global_seq as *const AtomicU32 as *mut u32;
-        unsafe {
-            libc::syscall(libc::SYS_futex, addr, libc::FUTEX_WAKE, i32::MAX, 0, 0, 0);
-        }
-    }
-
-    fn seq(&self) -> u32 {
-        self.header().global_seq.load(Ordering::Acquire)
-    }
-
-    /// FUTEX_WAIT on the global sequence counter.
-    fn wait_seq(&self, expected: u32, timeout: Option<Duration>) -> i32 {
-        let addr = &self.header().global_seq as *const AtomicU32 as *mut u32;
-        let mut ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        let ts_ptr = match timeout {
-            Some(d) => {
-                ts.tv_sec = d.as_secs() as _;
-                ts.tv_nsec = d.subsec_nanos() as _;
-                &mut ts as *mut _
-            }
-            None => std::ptr::null_mut(),
-        };
-        let ret = unsafe { libc::syscall(libc::SYS_futex, addr, libc::FUTEX_WAIT, expected, ts_ptr, 0, 0) };
-        if ret == 0 {
-            0
-        } else {
-            -errno()
-        }
-    }
 }
 
 struct RegionGuard<'a> {
@@ -331,11 +399,152 @@ impl Drop for RegionGuard<'_> {
     }
 }
 
+/// FUTEX_WAIT on a waiter node's seq word.
+fn futex_wait(addr: *const AtomicU32, expected: u32, timeout: Option<Duration>) -> i32 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let ts_ptr = match timeout {
+        Some(d) => {
+            ts.tv_sec = d.as_secs() as _;
+            ts.tv_nsec = d.subsec_nanos() as _;
+            &mut ts as *mut _
+        }
+        None => std::ptr::null_mut(),
+    };
+    let ret = unsafe {
+        libc::syscall(libc::SYS_futex, addr as *const u32, libc::FUTEX_WAIT, expected, ts_ptr, 0, 0)
+    };
+    if ret == 0 {
+        0
+    } else {
+        -errno()
+    }
+}
+
+fn futex_wake(addr: *const AtomicU32) {
+    unsafe {
+        libc::syscall(libc::SYS_futex, addr as *const u32, libc::FUTEX_WAKE, i32::MAX, 0, 0, 0);
+    }
+}
+
+/// Pop a node from the free list. Caller holds the lock.
+fn node_alloc(r: &Region) -> Option<u32> {
+    let head = r.header().node_free_head;
+    if head == NIL {
+        return None;
+    }
+    let node = r.node_ptr(head);
+    let next = unsafe { (*node).waiter_next };
+    unsafe {
+        (*(r.base as *mut Header)).node_free_head = next;
+        (*node).registered = 0;
+        (*node).obj = NIL;
+        (*node).wait_word = NIL;
+        (*node).obj_prev = NIL;
+        (*node).obj_next = NIL;
+        (*node).waiter_next = NIL;
+        (*node).pid = std::process::id();
+    }
+    Some(head)
+}
+
+/// Return a node to the free list. Caller holds the lock; the node must
+/// already be detached from any object list.
+fn node_free(r: &Region, idx: u32) {
+    let node = r.node_ptr(idx);
+    unsafe {
+        (*node).waiter_next = r.header().node_free_head;
+        (*(r.base as *mut Header)).node_free_head = idx;
+    }
+}
+
+/// Detach a node from its object's waiter list (O(1), doubly linked).
+/// Caller holds the lock.
+fn node_detach(r: &Region, idx: u32) {
+    let node = r.node_ptr(idx);
+    unsafe {
+        if (*node).registered == 0 {
+            return;
+        }
+        let obj = (*node).obj;
+        let slot = r.slot_ptr(obj);
+        if (*node).obj_prev == NIL {
+            (*slot).waiter_head = (*node).obj_next;
+        } else {
+            (*r.node_ptr((*node).obj_prev)).obj_next = (*node).obj_next;
+        }
+        if (*node).obj_next != NIL {
+            (*r.node_ptr((*node).obj_next)).obj_prev = (*node).obj_prev;
+        }
+        (*node).registered = 0;
+        (*node).obj = NIL;
+        (*node).obj_prev = NIL;
+        (*node).obj_next = NIL;
+    }
+}
+
+/// Register `node` on object `obj_idx`'s waiter list. Caller holds the lock.
+fn node_register(r: &Region, idx: u32, obj_idx: u32, wait_word: u32) {
+    let node = r.node_ptr(idx);
+    let slot = r.slot_ptr(obj_idx);
+    unsafe {
+        let old_head = (*slot).waiter_head;
+        (*node).registered = 1;
+        (*node).obj = obj_idx;
+        (*node).wait_word = wait_word;
+        (*node).obj_prev = NIL;
+        (*node).obj_next = old_head;
+        if old_head != NIL {
+            (*r.node_ptr(old_head)).obj_prev = idx;
+        }
+        (*slot).waiter_head = idx;
+    }
+}
+
+/// Wake every waiter registered on an object (kernel: wake_up(&obj->q)).
+/// Caller holds the lock. Each waiter is detached and its head seq bumped;
+/// it re-checks conditions when scheduled.
+fn wake_object(r: &Region, obj_idx: u32) {
+    let slot = r.slot_ptr(obj_idx);
+    let mut idx = unsafe { (*slot).waiter_head };
+    while idx != NIL {
+        let node = r.node_ptr(idx);
+        let (next, word) = unsafe { ((*node).obj_next, (*node).wait_word) };
+        node_detach(r, idx);
+        let head = r.node_ptr(word);
+        unsafe {
+            (*head).seq.fetch_add(1, Ordering::Release);
+            futex_wake(&(*head).seq);
+        }
+        idx = next;
+    }
+}
+
+/// Lock-free fast check followed by a locked wake walk, used by signal ops.
+/// The race with a waiter that registers just after our NIL load is closed
+/// by the waiter re-checking acquirability under the region lock before it
+/// sleeps (registration and wake walks are mutually exclusive).
+fn wake_waiters_if_any(r: &Region, obj_idx: u32) {
+    let slot = unsafe { &*r.slot_ptr(obj_idx) };
+    if ld32(&slot.waiter_head) == NIL {
+        return;
+    }
+    stat_bump(8); // wake_walks
+    if let Ok(_g) = r.lock_guard() {
+        wake_object(r, obj_idx);
+    }
+}
+
 fn current_tid() -> u32 {
     unsafe { libc::syscall(libc::SYS_gettid) as u32 }
 }
 
 fn open_and_map(path: &str) -> Result<Region, i32> {
+    if debug_enabled() {
+        debug_log(&format!("ntsync shm path: {path} (pid {})", std::process::id()));
+    }
     let c_path = CString::new(path).map_err(|_| libc::EINVAL)?;
     unsafe {
         let fd = libc::open(
@@ -358,7 +567,16 @@ fn open_and_map(path: &str) -> Result<Region, i32> {
             libc::close(fd);
             return Err(e);
         }
-        let need_init = st.st_size == 0;
+        let mut need_init = st.st_size == 0;
+        if !need_init && st.st_size != region_size() as i64 {
+            // Stale file from an older layout; recreate it (flock held).
+            if libc::ftruncate(fd, 0) != 0 {
+                let e = errno();
+                libc::close(fd);
+                return Err(e);
+            }
+            need_init = true;
+        }
         if need_init && libc::ftruncate(fd, region_size() as _) != 0 {
             let e = errno();
             libc::close(fd);
@@ -372,15 +590,22 @@ fn open_and_map(path: &str) -> Result<Region, i32> {
             fd,
             0,
         );
-        libc::flock(fd, libc::LOCK_UN);
-        libc::close(fd);
         if base == libc::MAP_FAILED {
-            return Err(errno());
+            let e = errno();
+            libc::flock(fd, libc::LOCK_UN);
+            libc::close(fd);
+            return Err(e);
         }
         let region = Region { base: base as *mut u8 };
+        if !need_init && region.header().magic == MAGIC && region.header().version != VERSION {
+            // Region left behind by an older library version; all live
+            // processes use this same library, so reinitialize in place
+            // (flock still held, no other process can be initializing).
+            need_init = true;
+        }
         if need_init {
-            let header = &mut *(base as *mut Header);
             std::ptr::write_bytes(base, 0, region_size());
+            let header = &mut *(base as *mut Header);
             let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
             libc::pthread_mutexattr_init(&mut attr);
             libc::pthread_mutexattr_setpshared(&mut attr, PTHREAD_PROCESS_SHARED);
@@ -390,15 +615,29 @@ fn open_and_map(path: &str) -> Result<Region, i32> {
             header.magic = MAGIC;
             header.version = VERSION;
             header.capacity = SLOT_COUNT;
-            header.global_seq = AtomicU32::new(0);
+            header.node_capacity = NODE_COUNT;
+            header.node_free_head = 0;
             header.next_scan = 0;
+            for i in 0..NODE_COUNT {
+                let node = &mut *region.node_ptr(i);
+                node.waiter_next = if i + 1 < NODE_COUNT { i + 1 } else { NIL };
+                node.registered = 0;
+                node.obj = NIL;
+                node.wait_word = NIL;
+                node.obj_prev = NIL;
+                node.obj_next = NIL;
+            }
         } else if region.header().magic != MAGIC
-            || region.header().version != VERSION
             || region.header().capacity != SLOT_COUNT
+            || region.header().node_capacity != NODE_COUNT
         {
+            libc::flock(fd, libc::LOCK_UN);
+            libc::close(fd);
             libc::munmap(base, region_size());
             return Err(libc::EINVAL);
         }
+        libc::flock(fd, libc::LOCK_UN);
+        libc::close(fd);
         Ok(region)
     }
 }
@@ -409,6 +648,7 @@ static REGION: OnceLock<Result<Region, i32>> = OnceLock::new();
 /// Called automatically with $TMPDIR/ntsync_userspace.shm if the library
 /// is used without an explicit init.
 pub fn init(path: Option<&str>) -> Result<(), Error> {
+    debug_enabled(); // read NTSYNC_DEBUG and arm the watchdog/stats at startup
     let result = REGION.get_or_init(|| resolve_path(path).and_then(|p| open_and_map(&p)));
     match result {
         Ok(_) => Ok(()),
@@ -433,13 +673,24 @@ fn alloc_slot(r: &Region) -> Option<u32> {
         let slot = r.slot_ptr(index);
         unsafe {
             if (*slot).state == SLOT_FREE {
-                (*slot).state = SLOT_USED;
+                (*slot).waiter_head = NIL;
                 (*(r.base as *mut Header)).next_scan = (index + 1) % SLOT_COUNT;
                 return Some(((*slot).generation << INDEX_BITS) | index);
             }
         }
     }
     None
+}
+
+/// Publish a freshly allocated slot: state fields first, SLOT_USED last
+/// (release) so lock-free readers never see a half-initialized object.
+unsafe fn slot_publish(r: &Region, handle: u32, obj_type: u32, w0: u64) {
+    let slot = r.slot_ptr(handle & INDEX_MASK);
+    st64(&(*slot).w0, w0);
+    st64(&(*slot).d, 0);
+    (*slot).obj_type = obj_type;
+    (*slot).pid = libc::getpid() as u32;
+    (&*(&(*slot).state as *const u32 as *const AtomicU32)).store(SLOT_USED, Ordering::Release);
 }
 
 pub fn create_semaphore(count: u32, max: u32) -> Result<u32, Error> {
@@ -449,31 +700,18 @@ pub fn create_semaphore(count: u32, max: u32) -> Result<u32, Error> {
     let r = region()?;
     let _g = r.lock_guard().map_err(Error::Init)?;
     let handle = alloc_slot(r).ok_or(Error::Init(libc::ENOMEM))?;
-    let slot = r.slot_ptr(handle & INDEX_MASK);
-    unsafe {
-        (*slot).obj_type = TYPE_SEM;
-        (*slot).pid = libc::getpid() as u32;
-        (*slot).a = count;
-        (*slot).b = max;
-    }
+    unsafe { slot_publish(r, handle, TYPE_SEM, pack_sem(count, max)) };
     Ok(handle)
 }
 
 pub fn create_mutex(owner: u32, count: u32) -> Result<u32, Error> {
-    if (owner == 0) != (count == 0) {
+    if (owner == 0) != (count == 0) || count > 0x7fff_ffff {
         return Err(Error::Invalid);
     }
     let r = region()?;
     let _g = r.lock_guard().map_err(Error::Init)?;
     let handle = alloc_slot(r).ok_or(Error::Init(libc::ENOMEM))?;
-    let slot = r.slot_ptr(handle & INDEX_MASK);
-    unsafe {
-        (*slot).obj_type = TYPE_MUTEX;
-        (*slot).pid = libc::getpid() as u32;
-        (*slot).a = count;
-        (*slot).b = owner;
-        (*slot).c = 0;
-    }
+    unsafe { slot_publish(r, handle, TYPE_MUTEX, pack_mutex(owner, count, false)) };
     Ok(handle)
 }
 
@@ -481,14 +719,7 @@ pub fn create_event(manual: bool, signaled: bool) -> Result<u32, Error> {
     let r = region()?;
     let _g = r.lock_guard().map_err(Error::Init)?;
     let handle = alloc_slot(r).ok_or(Error::Init(libc::ENOMEM))?;
-    let slot = r.slot_ptr(handle & INDEX_MASK);
-    unsafe {
-        (*slot).obj_type = TYPE_EVENT;
-        (*slot).pid = libc::getpid() as u32;
-        (*slot).a = signaled as u32;
-        (*slot).b = manual as u32;
-        (*slot).d = 0;
-    }
+    unsafe { slot_publish(r, handle, TYPE_EVENT, pack_event(signaled, manual)) };
     Ok(handle)
 }
 
@@ -497,204 +728,386 @@ pub fn close(handle: u32) -> bool {
     let Ok(_g) = r.lock_guard() else { return false };
     let Some(slot) = r.slot(handle) else { return false };
     unsafe {
-        (*slot).state = SLOT_FREE;
+        // Free first (acquire/release pairs with slot_publish), then wake
+        // waiters so they re-validate and fail with -EINVAL (kernel keeps
+        // objects alive via fds, so it has no equivalent).
+        (&*(&(*slot).state as *const u32 as *const AtomicU32)).store(SLOT_FREE, Ordering::Release);
         (*slot).generation = (*slot).generation.wrapping_add(1);
     }
-    r.bump_and_wake();
+    wake_object(r, handle & INDEX_MASK);
     true
 }
 
 /// Release `count` from a semaphore. Returns the previous count.
-/// On overflow the state is left unchanged (kernel: -EOVERFLOW).
+/// On overflow the state is left unchanged (kernel: -EOVERFLOW). Lock-free.
 pub fn sem_release(handle: u32, count: u32) -> Result<u32, Error> {
     let r = region()?;
-    let _g = r.lock_guard().map_err(Error::Init)?;
-    let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_SEM).ok_or(Error::Invalid)?;
-    unsafe {
-        let sum = (*slot)
-            .a
-            .checked_add(count)
-            .filter(|&sum| sum <= (*slot).b)
-            .ok_or(Error::Overflow)?;
-        let prev = (*slot).a;
-        (*slot).a = sum;
-        r.bump_and_wake();
-        Ok(prev)
+    let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_SEM).ok_or(Error::Invalid)?;
+    let w0 = unsafe { &(*slot).w0 };
+    loop {
+        let w = ld64(w0);
+        let cur = w as u32;
+        let max = (w >> 32) as u32;
+        stat_bump(7); // signal_ops
+        let Some(sum) = cur.checked_add(count).filter(|&s| s <= max) else {
+            return Err(Error::Overflow);
+        };
+        match cas64(w0, w, pack_sem(sum, max)) {
+            Ok(_) => {
+                wake_waiters_if_any(r, handle & INDEX_MASK);
+                return Ok(cur);
+            }
+            Err(_) => continue,
+        }
     }
 }
 
 pub fn event_set(handle: u32) -> Result<u32, Error> {
+    stat_bump(7);
     let r = region()?;
-    let _g = r.lock_guard().map_err(Error::Init)?;
-    let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_EVENT).ok_or(Error::Invalid)?;
-    let prev = unsafe {
-        let prev = (*slot).a;
-        (*slot).a = 1;
-        prev
-    };
-    r.bump_and_wake();
-    Ok(prev)
+    let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_EVENT).ok_or(Error::Invalid)?;
+    let w0 = unsafe { &(*slot).w0 };
+    loop {
+        let w = ld64(w0);
+        let prev = w as u32;
+        if prev != 0 {
+            return Ok(prev);
+        }
+        match cas64(w0, w, w | 1) {
+            Ok(_) => {
+                wake_waiters_if_any(r, handle & INDEX_MASK);
+                return Ok(0);
+            }
+            Err(_) => continue,
+        }
+    }
 }
 
 pub fn event_reset(handle: u32) -> Result<u32, Error> {
+    stat_bump(7);
     let r = region()?;
-    let _g = r.lock_guard().map_err(Error::Init)?;
-    let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_EVENT).ok_or(Error::Invalid)?;
-    let prev = unsafe {
-        let prev = (*slot).a;
-        (*slot).a = 0;
-        prev
-    };
-    r.bump_and_wake();
-    Ok(prev)
+    let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_EVENT).ok_or(Error::Invalid)?;
+    let w0 = unsafe { &(*slot).w0 };
+    loop {
+        let w = ld64(w0);
+        let prev = w as u32;
+        if prev == 0 {
+            return Ok(0);
+        }
+        match cas64(w0, w, w & !1u64) {
+            Ok(_) => return Ok(prev),
+            Err(_) => continue,
+        }
+    }
 }
 
 pub fn event_pulse(handle: u32) -> Result<u32, Error> {
+    // Rare and awkward for the packed-state fast path (two words involved):
+    // do it under the region lock, like the kernel's pulse under
+    // wait_all_lock.
     let r = region()?;
     let _g = r.lock_guard().map_err(Error::Init)?;
     let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_EVENT).ok_or(Error::Invalid)?;
     let prev = unsafe {
-        let prev = (*slot).a;
+        let prev = ld64(&(*slot).w0) as u32;
         // Wake all current waiters, then return to unsignaled.
-        (*slot).d = (*slot).d.wrapping_add(1);
-        (*slot).a = 0;
+        let d = ld64(&(*slot).d);
+        st64(&(*slot).d, d.wrapping_add(1));
+        st64(&(*slot).w0, ld64(&(*slot).w0) & !1u64);
         prev
     };
-    r.bump_and_wake();
+    wake_object(r, handle & INDEX_MASK);
     Ok(prev)
 }
 
 /// Unlock a mutex held by `owner`. Returns the previous recursion count.
+/// Lock-free.
 pub fn mutex_unlock(handle: u32, owner: u32) -> Result<u32, Error> {
+    stat_bump(7);
     if owner == 0 {
         return Err(Error::Invalid);
     }
     let r = region()?;
-    let _g = r.lock_guard().map_err(Error::Init)?;
-    let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_MUTEX).ok_or(Error::Invalid)?;
-    unsafe {
-        if (*slot).b != owner {
+    let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_MUTEX).ok_or(Error::Invalid)?;
+    let w0 = unsafe { &(*slot).w0 };
+    loop {
+        let w = ld64(w0);
+        let cur_owner = w as u32;
+        let hi = (w >> 32) as u32;
+        let count = hi & 0x7fff_ffff;
+        let ownerdead = hi >> 31 != 0;
+        if cur_owner != owner {
             return Err(Error::Perm);
         }
-        let prev = (*slot).a;
-        (*slot).a -= 1;
-        if (*slot).a == 0 {
-            (*slot).b = 0;
+        let freed = count == 1;
+        let new = pack_mutex(if freed { 0 } else { owner }, count - 1, ownerdead);
+        match cas64(w0, w, new) {
+            Ok(_) => {
+                if freed {
+                    wake_waiters_if_any(r, handle & INDEX_MASK);
+                }
+                return Ok(count);
+            }
+            Err(_) => continue,
         }
-        r.bump_and_wake();
-        Ok(prev)
     }
 }
 
 /// Mark a mutex abandoned and release ownership (kernel: MUTEX_KILL).
+/// Lock-free.
 pub fn mutex_kill(handle: u32, owner: u32) -> Result<(), Error> {
+    stat_bump(7);
     if owner == 0 {
         return Err(Error::Invalid);
     }
     let r = region()?;
-    let _g = r.lock_guard().map_err(Error::Init)?;
-    let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_MUTEX).ok_or(Error::Invalid)?;
-    unsafe {
-        if (*slot).b != owner {
+    let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_MUTEX).ok_or(Error::Invalid)?;
+    let w0 = unsafe { &(*slot).w0 };
+    loop {
+        let w = ld64(w0);
+        if w as u32 != owner {
             return Err(Error::Perm);
         }
-        (*slot).c = 1;
-        (*slot).b = 0;
-        (*slot).a = 0;
-        r.bump_and_wake();
-        Ok(())
+        match cas64(w0, w, pack_mutex(0, 0, true)) {
+            Ok(_) => {
+                wake_waiters_if_any(r, handle & INDEX_MASK);
+                return Ok(());
+            }
+            Err(_) => continue,
+        }
     }
 }
 
-/// Returns (count, max).
+/// Returns (count, max). Lock-free.
 pub fn read_sem(handle: u32) -> Result<(u32, u32), Error> {
     let r = region()?;
-    let _g = r.lock_guard().map_err(Error::Init)?;
-    let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_SEM).ok_or(Error::Invalid)?;
-    Ok(unsafe { ((*slot).a, (*slot).b) })
+    let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_SEM).ok_or(Error::Invalid)?;
+    let w = ld64(unsafe { &(*slot).w0 });
+    Ok((w as u32, (w >> 32) as u32))
 }
 
-/// Returns (count, owner, owner_dead).
+/// Returns (count, owner, owner_dead). Lock-free.
 pub fn read_mutex(handle: u32) -> Result<(u32, u32, bool), Error> {
     let r = region()?;
-    let _g = r.lock_guard().map_err(Error::Init)?;
-    let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_MUTEX).ok_or(Error::Invalid)?;
-    Ok(unsafe { ((*slot).a, (*slot).b, (*slot).c != 0) })
+    let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_MUTEX).ok_or(Error::Invalid)?;
+    let w = ld64(unsafe { &(*slot).w0 });
+    let hi = (w >> 32) as u32;
+    Ok((hi & 0x7fff_ffff, w as u32, hi >> 31 != 0))
 }
 
-/// Returns (manual, signaled).
+/// Returns (manual, signaled). Lock-free.
 pub fn read_event(handle: u32) -> Result<(bool, bool), Error> {
     let r = region()?;
-    let _g = r.lock_guard().map_err(Error::Init)?;
-    let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_EVENT).ok_or(Error::Invalid)?;
-    Ok(unsafe { ((*slot).b != 0, (*slot).a != 0) })
+    let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_EVENT).ok_or(Error::Invalid)?;
+    let w = ld64(unsafe { &(*slot).w0 });
+    Ok(((w >> 32) != 0, (w as u32) != 0))
 }
 
 /// Check whether an object is acquirable ("locked" in kernel terms) without
-/// mutating it.
+/// mutating it. Lock-free.
 fn is_locked(slot: &Slot, owner: u32, entry_seq: u64) -> bool {
+    let w = ld64(&slot.w0);
     match slot.obj_type {
-        TYPE_SEM => slot.a > 0,
-        TYPE_MUTEX => (slot.b == 0 || slot.b == owner) && slot.a < u32::MAX,
-        TYPE_EVENT => slot.a != 0 || slot.d != entry_seq,
+        TYPE_SEM => w as u32 > 0,
+        TYPE_MUTEX => {
+            let cur_owner = w as u32;
+            let count = ((w >> 32) as u32) & 0x7fff_ffff;
+            (cur_owner == 0 || cur_owner == owner) && count < 0x7fff_ffff
+        }
+        TYPE_EVENT => w as u32 != 0 || ld64(&slot.d) != entry_seq,
         _ => false,
     }
 }
 
-/// Attempt to acquire an object. Returns Some(owner_dead) on success, None if
-/// not acquirable.
-fn try_acquire(slot: &mut Slot, owner: u32, entry_seq: u64) -> Option<bool> {
+/// Attempt to acquire an object (lock-free CAS). Returns Some(owner_dead)
+/// on success, None if not acquirable.
+fn try_acquire(slot: &Slot, owner: u32, entry_seq: u64) -> Option<bool> {
     match slot.obj_type {
-        TYPE_SEM => {
-            if slot.a > 0 {
-                slot.a -= 1;
-                Some(false)
-            } else {
-                None
+        TYPE_SEM => loop {
+            let w = ld64(&slot.w0);
+            let count = w as u32;
+            if count == 0 {
+                return None;
             }
-        }
-        TYPE_MUTEX => {
-            if (slot.b == 0 || slot.b == owner) && slot.a < u32::MAX {
-                let owner_dead = if slot.b == 0 {
-                    let od = slot.c != 0;
-                    slot.c = 0;
-                    od
-                } else {
-                    false
-                };
-                slot.a += 1;
-                slot.b = owner;
-                Some(owner_dead)
-            } else {
-                None
+            let max = (w >> 32) as u32;
+            match cas64(&slot.w0, w, pack_sem(count - 1, max)) {
+                Ok(_) => return Some(false),
+                Err(_) => continue,
             }
-        }
+        },
+        TYPE_MUTEX => loop {
+            let w = ld64(&slot.w0);
+            let cur_owner = w as u32;
+            let hi = (w >> 32) as u32;
+            let count = hi & 0x7fff_ffff;
+            let ownerdead = hi >> 31 != 0;
+            if count >= 0x7fff_ffff {
+                return None;
+            }
+            let (new, od) = if cur_owner == 0 {
+                (pack_mutex(owner, count + 1, false), ownerdead)
+            } else if cur_owner == owner {
+                (pack_mutex(owner, count + 1, ownerdead), false)
+            } else {
+                return None;
+            };
+            match cas64(&slot.w0, w, new) {
+                Ok(_) => return Some(od),
+                Err(_) => continue,
+            }
+        },
         TYPE_EVENT => {
-            if slot.a != 0 {
-                if slot.b == 0 {
-                    // auto-reset
-                    slot.a = 0;
+            let w = ld64(&slot.w0);
+            if w as u32 != 0 {
+                if (w >> 32) == 0 {
+                    // auto-reset: claim it
+                    loop {
+                        let w = ld64(&slot.w0);
+                        if w as u32 == 0 {
+                            // Lost the race; fall through to pulse check.
+                            break;
+                        }
+                        match cas64(&slot.w0, w, w & !1u64) {
+                            Ok(_) => return Some(false),
+                            Err(_) => continue,
+                        }
+                    }
+                } else {
+                    return Some(false);
                 }
-                Some(false)
-            } else if slot.d != entry_seq {
+            }
+            if ld64(&slot.d) != entry_seq {
                 // Pulsed during the wait; considered satisfied (pulse leaves
                 // the event unsignaled, so nothing to reset).
-                Some(false)
-            } else {
-                None
+                return Some(false);
             }
+            None
         }
         _ => None,
     }
 }
 
-/// `alert` is the optional alertable-wait event handle (0 = none), matching
-/// the kernel's ntsync_wait_args.alert: if it is (or becomes) signaled, the
-/// wait completes with index == handles.len(). The alert event is only
-/// tested, never acquired (wineserver resets it when the APC queue empties).
-/// Log to stderr (kept dependency-free so ntdll.so/wineserver do not need liblog).
+/// Undo a try_acquire on `slot` (wait-all rollback). Mutex state is restored
+/// wholesale (we own it, nobody else can mutate it); semaphore count is
+/// incremented back (concurrent releases must not be lost); an auto-reset
+/// event is re-signaled.
+fn rollback_acquire(slot: &Slot, owner: u32, owner_dead_was: bool) {
+    match slot.obj_type {
+        TYPE_SEM => loop {
+            let w = ld64(&slot.w0);
+            let count = w as u32;
+            let max = (w >> 32) as u32;
+            if cas64(&slot.w0, w, pack_sem(count + 1, max)).is_ok() {
+                return;
+            }
+        },
+        TYPE_MUTEX => loop {
+            let w = ld64(&slot.w0);
+            let count = ((w >> 32) as u32) & 0x7fff_ffff;
+            if count == 1 {
+                // We hold the only reference: restore the empty state.
+                if cas64(&slot.w0, w, pack_mutex(0, 0, owner_dead_was)).is_ok() {
+                    return;
+                }
+            } else {
+                // Recursive self-acquire: just drop one level.
+                let od = ((w >> 32) as u32) >> 31 != 0;
+                if cas64(&slot.w0, w, pack_mutex(owner, count - 1, od)).is_ok() {
+                    return;
+                }
+            }
+        },
+        TYPE_EVENT => loop {
+            let w = ld64(&slot.w0);
+            // Only auto-reset events were mutated (signaled 1 -> 0).
+            if (w >> 32) == 0 && (w as u32) == 0 {
+                if cas64(&slot.w0, w, w | 1).is_ok() {
+                    return;
+                }
+            } else {
+                return;
+            }
+        },
+        _ => {}
+    }
+}
+
+/// Log to stderr, stdout, and $TMPDIR/ntsync_debug.log. The launcher's
+/// logcat only captures its own stdout, so the file is the reliable
+/// channel for in-game diagnostics.
 fn debug_log(msg: &str) {
-    eprintln!("{msg}");
+    use std::io::Write;
+    // Raw writes that never panic: wineserver/game processes may close or
+    // redirect stdout/stderr, and println!/eprintln! panic on EBADF, which
+    // would silently kill the stats thread.
+    let mut line = msg.as_bytes().to_vec();
+    line.push(b'\n');
+    unsafe {
+        let _ = libc::write(2, line.as_ptr() as *const _, line.len());
+        let _ = libc::write(1, line.as_ptr() as *const _, line.len());
+    }
+    if let Some(tmp) = std::env::var_os("TMPDIR") {
+        let path = std::path::PathBuf::from(tmp).join("ntsync_debug.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(&line);
+        }
+    }
+}
+
+// ---- Instrumentation (NTSYNC_DEBUG) ----
+// Cheap per-process relaxed counters; a background thread dumps them every
+// 10s so on-device runs can show where the time actually goes.
+mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub const NAMES: [&str; 10] = [
+        "wait_calls",        // total wait_any/wait_all calls
+        "wait_fast_ok",      // satisfied without any lock
+        "wait_blocked",      // actually slept on a futex
+        "futex_sleeps",      // futex_wait syscalls
+        "lock_acq",          // region lock acquisitions
+        "lock_contended",    // lock acquisitions that looped/EOWNERDEAD
+        "cas_retries",       // CAS loop retries (contention on object words)
+        "signal_ops",        // release/set/unlock/... calls
+        "wake_walks",        // times a signal op found waiters and locked
+        "nodes_registered",  // waiter-node registrations
+    ];
+    pub static COUNTERS: [AtomicU64; 10] = [
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0),
+    ];
+
+    #[inline]
+    pub fn bump(i: usize) {
+        COUNTERS[i].fetch_add(1, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn add(i: usize, n: u64) {
+        COUNTERS[i].fetch_add(n, Ordering::Relaxed);
+    }
+}
+use stats::{add as stat_add, bump as stat_bump};
+
+fn stats_dump_loop() {
+    std::thread::spawn(|| {
+        let dump = |line: &mut String| {
+            line.clear();
+            line.push_str(&format!("ntsync stats (pid {}):", std::process::id()));
+            for (i, name) in stats::NAMES.iter().enumerate() {
+                let v = stats::COUNTERS[i].load(Ordering::Relaxed);
+                line.push_str(&format!(" {name}={v}"));
+            }
+            debug_log(line);
+        };
+        let mut line = String::new();
+        std::thread::sleep(Duration::from_secs(1));
+        dump(&mut line);
+        loop {
+            std::thread::sleep(Duration::from_secs(10));
+            dump(&mut line);
+        }
+    });
 }
 
 fn debug_enabled() -> bool {
@@ -705,6 +1118,7 @@ fn debug_enabled() -> bool {
             .unwrap_or(false);
         if on {
             debug_log(&format!("watchdog armed (pid {})", std::process::id()));
+            stats_dump_loop();
         }
         on
     })
@@ -727,11 +1141,10 @@ fn debug_dump_stuck_wait(
         _ => "?",
     };
     debug_log(&format!(
-        "stuck wait: {:?} elapsed, {} owner={} seq={} alert={:#x}",
+        "stuck wait: {:?} elapsed, {} owner={} alert={:#x}",
         start.elapsed(),
         if all { "all" } else { "any" },
         owner,
-        r.seq(),
         alert,
     ));
     if let Ok(_g) = r.lock_guard() {
@@ -739,10 +1152,11 @@ fn debug_dump_stuck_wait(
             match r.slot(h) {
                 Some(slot) => unsafe {
                     let s = &*slot;
-                    let locked = is_locked(s, owner, s.d);
+                    let locked = is_locked(s, owner, ld64(&s.d));
                     debug_log(&format!(
-                        "  {:#010x} {} state={} a={} b={} c={} d={} pid={} gen={} now_signaled={}",
-                        h, type_name(s.obj_type), s.state, s.a, s.b, s.c, s.d, s.pid, s.generation, locked,
+                        "  {:#010x} {} state={} w0={:#x} d={} pid={} gen={} waiters={} now_signaled={}",
+                        h, type_name(s.obj_type), s.state, ld64(&s.w0), ld64(&s.d), s.pid, s.generation,
+                        s.waiter_head != NIL, locked,
                     ));
                 },
                 None => debug_log(&format!("  {:#010x} <closed/invalid>", h)),
@@ -759,124 +1173,242 @@ pub fn wait_all(handles: &[u32], owner: u32, timeout: Option<Duration>, alert: u
     wait(handles, owner, timeout, true, alert)
 }
 
+/// Detach and free all nodes of a waiter (caller holds the lock).
+fn waiter_cleanup(r: &Region, nodes: &mut Vec<u32>) {
+    for &idx in nodes.iter() {
+        node_detach(r, idx);
+    }
+    for &idx in nodes.iter() {
+        node_free(r, idx);
+    }
+    nodes.clear();
+}
+
+/// Try to satisfy the wait right now (lock-free). Some(outcome) = done,
+/// None = not satisfiable at this instant. Handles must be pre-validated.
+fn try_satisfy(
+    r: &Region,
+    handles: &[u32],
+    owner: u32,
+    entry_seqs: &[u64; MAX_WAIT_COUNT],
+    all: bool,
+) -> Option<WaitOutcome> {
+    if !all {
+        for (i, h) in handles.iter().enumerate() {
+            let slot = unsafe { &*r.slot_ptr(h & INDEX_MASK) };
+            if let Some(owner_dead) = try_acquire(slot, owner, entry_seqs[i]) {
+                return Some(WaitOutcome::Signaled {
+                    index: i as u32,
+                    owner_dead,
+                });
+            }
+        }
+        None
+    } else {
+        // Acquire one by one; roll back if any object is busy.
+        let mut acquired: Vec<(usize, bool)> = Vec::with_capacity(handles.len());
+        let mut owner_dead = false;
+        for (i, h) in handles.iter().enumerate() {
+            let slot = unsafe { &*r.slot_ptr(h & INDEX_MASK) };
+            match try_acquire(slot, owner, entry_seqs[i]) {
+                Some(od) => {
+                    owner_dead |= od;
+                    acquired.push((i, od));
+                }
+                None => {
+                    for &(j, od) in &acquired {
+                        rollback_acquire(
+                            unsafe { &*r.slot_ptr(handles[j] & INDEX_MASK) },
+                            owner,
+                            od,
+                        );
+                    }
+                    return None;
+                }
+            }
+        }
+        Some(WaitOutcome::Signaled { index: 0, owner_dead })
+    }
+}
+
 fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert: u32) -> WaitOutcome {
-    if owner == 0
-        || handles.is_empty()
-        || handles.len() > MAX_WAIT_COUNT
-        || handles.iter().collect::<std::collections::HashSet<_>>().len() != handles.len()
-    {
+    if owner == 0 || handles.is_empty() || handles.len() > MAX_WAIT_COUNT {
         return WaitOutcome::Invalid;
+    }
+    // Reject duplicate handles (kernel behavior) without allocating.
+    for (i, h) in handles.iter().enumerate() {
+        if handles[..i].contains(h) {
+            return WaitOutcome::Invalid;
+        }
     }
     let Ok(r) = region() else {
         return WaitOutcome::Invalid;
     };
-
-    // Validate the alert event handle up front.
-    if alert != 0 {
-        let Ok(_g) = r.lock_guard() else {
-            return WaitOutcome::Invalid;
-        };
-        let valid = match r.slot(alert) {
-            Some(slot) => unsafe { (*slot).obj_type == TYPE_EVENT },
-            None => false,
-        };
-        if !valid {
-            return WaitOutcome::Invalid;
-        }
-    }
+    stat_bump(0); // wait_calls
 
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
     let debug = debug_enabled();
     let start = std::time::Instant::now();
     let mut last_dump = start;
 
-    // Validate handles and snapshot event pulse sequences at wait entry.
     let mut entry_seqs = [0u64; MAX_WAIT_COUNT];
-    {
+    let n_nodes = handles.len() + (alert != 0) as usize;
+    let mut nodes: Vec<u32> = Vec::with_capacity(n_nodes);
+
+    // ---- Fast path: validate and try to acquire without any lock. ----
+    let fast_valid = handles.iter().enumerate().all(|(i, h)| {
+        match r.slot(*h) {
+            Some(slot) => unsafe {
+                let s = &*slot;
+                entry_seqs[i] = if s.obj_type == TYPE_EVENT { ld64(&s.d) } else { 0 };
+                matches!(s.obj_type, TYPE_SEM | TYPE_MUTEX | TYPE_EVENT)
+            },
+            None => false,
+        }
+    }) && (alert == 0
+        || matches!(r.slot(alert), Some(s) if unsafe { (*s).obj_type } == TYPE_EVENT));
+    if fast_valid {
+        if alert != 0 {
+            let slot = unsafe { &*r.slot(alert).unwrap() };
+            if ld64(&slot.w0) as u32 != 0 {
+                return WaitOutcome::Signaled {
+                    index: handles.len() as u32,
+                    owner_dead: false,
+                };
+            }
+        }
+        if let Some(outcome) = try_satisfy(r, handles, owner, &entry_seqs, all) {
+            stat_bump(1); // wait_fast_ok
+            return outcome;
+        }
+        if timeout == Some(Duration::ZERO) {
+            return WaitOutcome::Timeout;
+        }
+    }
+    // Fall through to the blocking path; the locked section below
+    // re-validates authoritatively (a close racing the fast path fails it).
+
+    loop {
+        // Take the region lock for the validate/register cycle. Registration
+        // and signalers' wake walks are mutually exclusive, and we re-check
+        // acquirability under the lock before sleeping, so no wakeup is lost.
         let Ok(_g) = r.lock_guard() else {
+            if let Ok(g) = r.lock_guard() {
+                waiter_cleanup(r, &mut nodes);
+                drop(g);
+            }
             return WaitOutcome::Invalid;
         };
+
+        // Authoritative validation (also catches objects closed mid-wait).
+        let mut valid = true;
         for (i, h) in handles.iter().enumerate() {
-            let Some(slot) = r.slot(*h) else {
-                return WaitOutcome::Invalid;
-            };
-            unsafe {
-                if (*slot).obj_type == TYPE_EVENT {
-                    entry_seqs[i] = (*slot).d;
+            match r.slot(*h) {
+                Some(slot) => unsafe {
+                    let s = &*slot;
+                    if !matches!(s.obj_type, TYPE_SEM | TYPE_MUTEX | TYPE_EVENT) {
+                        valid = false;
+                        break;
+                    }
+                    if nodes.is_empty() && s.obj_type == TYPE_EVENT {
+                        entry_seqs[i] = ld64(&s.d);
+                    }
+                },
+                None => {
+                    valid = false;
+                    break;
                 }
             }
         }
-    }
+        if valid && alert != 0 {
+            valid = matches!(r.slot(alert), Some(s) if unsafe { (*s).obj_type } == TYPE_EVENT);
+        }
+        if !valid {
+            waiter_cleanup(r, &mut nodes);
+            return WaitOutcome::Invalid;
+        }
 
-    loop {
-        let seq;
-        {
-            let Ok(_g) = r.lock_guard() else {
-                return WaitOutcome::Invalid;
-            };
-
-            // Re-validate: objects may have been closed while waiting.
-            if handles.iter().any(|h| r.slot(*h).is_none()) {
-                return WaitOutcome::Invalid;
-            }
-
-            // Alertable wait: the alert event wins immediately if signaled.
-            if alert != 0 {
-                let Some(slot) = r.slot(alert) else {
-                    return WaitOutcome::Invalid;
+        // Alertable wait: the alert event wins immediately if signaled.
+        // It is only tested, never acquired (wineserver resets it when the
+        // APC queue empties) - kernel ntsync_wait_args.alert contract.
+        if alert != 0 {
+            let slot = r.slot(alert).expect("validated above");
+            if ld64(unsafe { &(*slot).w0 }) as u32 != 0 {
+                waiter_cleanup(r, &mut nodes);
+                return WaitOutcome::Signaled {
+                    index: handles.len() as u32,
+                    owner_dead: false,
                 };
-                if unsafe { (*slot).a != 0 } {
-                    return WaitOutcome::Signaled {
-                        index: handles.len() as u32,
-                        owner_dead: false,
-                    };
-                }
             }
+        }
 
-            if !all {
-                for (i, h) in handles.iter().enumerate() {
-                    let slot = r.slot_ptr(h & INDEX_MASK);
-                    if let Some(owner_dead) =
-                        try_acquire(unsafe { &mut *slot }, owner, entry_seqs[i])
-                    {
-                        return WaitOutcome::Signaled {
-                            index: i as u32,
-                            owner_dead,
-                        };
+        // Allocate nodes on first block, then (re)register one node per
+        // object *before* the acquire attempt below. Signalers change object
+        // state with a lock-free CAS and only afterwards walk waiter lists,
+        // so registration must precede our check: a state change that landed
+        // before the check is seen by it, and one that lands after finds our
+        // nodes on the list (registration and wake walks are mutually
+        // exclusive under the lock). Check-then-register would race the CAS
+        // and lose the wakeup.
+        if nodes.is_empty() {
+            for _ in 0..n_nodes {
+                match node_alloc(r) {
+                    Some(idx) => nodes.push(idx),
+                    None => {
+                        waiter_cleanup(r, &mut nodes);
+                        return WaitOutcome::Invalid; // waiter pool exhausted
                     }
                 }
-            } else {
-                let satisfied = handles.iter().enumerate().all(|(i, h)| {
-                    is_locked(unsafe { &*r.slot_ptr(h & INDEX_MASK) }, owner, entry_seqs[i])
-                });
-                if satisfied {
-                    let mut owner_dead = false;
-                    for (i, h) in handles.iter().enumerate() {
-                        if let Some(od) =
-                            try_acquire(unsafe { &mut *r.slot_ptr(h & INDEX_MASK) }, owner, entry_seqs[i])
-                        {
-                            owner_dead |= od;
-                        }
-                    }
-                    return WaitOutcome::Signaled {
-                        index: 0,
-                        owner_dead,
-                    };
-                }
             }
-            seq = r.seq();
-        } // unlock
+        }
+        let head = nodes[0];
+        for (i, h) in handles.iter().enumerate() {
+            if unsafe { (*r.node_ptr(nodes[i])).registered } == 0 {
+                node_register(r, nodes[i], h & INDEX_MASK, head);
+            }
+        }
+        if alert != 0 {
+            let an = nodes[handles.len()];
+            if unsafe { (*r.node_ptr(an)).registered } == 0 {
+                node_register(r, an, alert & INDEX_MASK, head);
+            }
+        }
 
+        // Make the registration globally visible before checking object
+        // state: an Acquire load alone lets the registration store linger in
+        // the store buffer (StoreLoad reordering), so a signaler's lock-free
+        // waiter_head read could still see NIL after its state CAS. The
+        // fence pairs with the signaler's CAS-then-read order: if our check
+        // observes pre-CAS state, the signaler's read is guaranteed to
+        // observe our registration.
+        std::sync::atomic::fence(Ordering::SeqCst);
+
+        // Authoritative acquire attempt.
+        if let Some(outcome) = try_satisfy(r, handles, owner, &entry_seqs, all) {
+            waiter_cleanup(r, &mut nodes);
+            return outcome;
+        }
+
+        // Timeout check before going to sleep.
         let remaining = match deadline {
             Some(dl) => {
                 let now = std::time::Instant::now();
                 if now >= dl {
+                    waiter_cleanup(r, &mut nodes);
                     return WaitOutcome::Timeout;
                 }
                 Some(dl - now)
             }
             None => None,
         };
+
+        stat_bump(2); // wait_blocked
+        stat_add(9, n_nodes as u64); // nodes_registered
+        // Sample the head seq under the lock: any signaler that detaches us
+        // after this point bumps the seq, so futex_wait below either blocks
+        // or fails immediately with EAGAIN - never a missed wakeup.
+        let seq = unsafe { (*r.node_ptr(head)).seq.load(Ordering::Acquire) };
+        drop(_g);
 
         // With NTSYNC_DEBUG=1, cap each futex wait at 5s so a stuck wait
         // periodically dumps the object states to stderr.
@@ -886,44 +1418,75 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             remaining
         };
 
-        match r.wait_seq(seq, slice) {
+        stat_bump(3); // futex_sleeps
+        let ret = futex_wait(unsafe { &(*r.node_ptr(head)).seq }, seq, slice);
+        match ret {
             0 | libc::EAGAIN => {}
             x if x == libc::ETIMEDOUT => {
-                if deadline.is_some_and(|dl| std::time::Instant::now() >= dl) {
-                    return WaitOutcome::Timeout;
-                }
-                if debug && last_dump.elapsed() >= Duration::from_secs(5) {
+                // A signal may have landed just as the deadline expired; do
+                // not decide here. Fall through to detach + loop, where the
+                // locked section re-attempts the acquire authoritatively
+                // before the deadline check returns Timeout.
+                if debug && deadline.is_none_or(|dl| std::time::Instant::now() < dl) && last_dump.elapsed() >= Duration::from_secs(5) {
                     debug_dump_stuck_wait(r, handles, owner, alert, all, start);
                     last_dump = std::time::Instant::now();
                 }
             }
             _ => {} // EINTR and friends: loop and re-check
         }
-    }
-}
-
-/// Free all objects created by processes that no longer exist.
-/// Userspace has no fd-close-on-death hook, so callers (e.g. a launcher or
-/// wineserver replacement) should run this after a process exits.
-pub fn sweep_dead() -> Result<u32, Error> {
-    let r = region()?;
-    let _g = r.lock_guard().map_err(Error::Init)?;
-    let mut freed = 0;
-    for index in 0..SLOT_COUNT {
-        let slot = r.slot_ptr(index);
-        unsafe {
-            if (*slot).state == SLOT_USED && (*slot).pid != 0 {
-                let ret = libc::kill((*slot).pid as i32, 0);
-                if ret != 0 && errno() == libc::ESRCH {
-                    (*slot).state = SLOT_FREE;
-                    (*slot).generation = (*slot).generation.wrapping_add(1);
-                    freed += 1;
+        // Detach our nodes that are still registered (timeout/EINTR wake);
+        // signalers already detached the ones they woke. Peek lock-free
+        // first: on the normal signal-wake path nothing is registered, so
+        // we skip the robust-mutex + sigmask round entirely. A stale `1`
+        // read just means a harmless extra lock; a detached node's `0` is
+        // stable (only we re-register our own nodes, after this point).
+        let any_registered = nodes
+            .iter()
+            .any(|&idx| unsafe { ld32(&(*r.node_ptr(idx)).registered) } != 0);
+        if any_registered {
+            if let Ok(_g) = r.lock_guard() {
+                for &idx in nodes.iter() {
+                    node_detach(r, idx);
                 }
             }
         }
     }
-    if freed > 0 {
-        r.bump_and_wake();
+}
+
+/// Free all objects created by processes that no longer exist, and purge
+/// waiter nodes left behind by dead waiters. Userspace has no fd-close-on-
+/// death hook, so callers (e.g. a launcher or wineserver replacement)
+/// should run this after a process exits.
+pub fn sweep_dead() -> Result<u32, Error> {
+    let r = region()?;
+    let _g = r.lock_guard().map_err(Error::Init)?;
+    let pid_alive = |pid: u32| -> bool {
+        if pid == 0 {
+            return false;
+        }
+        let ret = unsafe { libc::kill(pid as i32, 0) };
+        !(ret != 0 && errno() == libc::ESRCH)
+    };
+    // Purge nodes of dead waiters first so freed objects have empty lists.
+    for i in 0..NODE_COUNT {
+        let node = r.node_ptr(i);
+        unsafe {
+            if (*node).registered != 0 && !pid_alive((*node).pid) {
+                node_detach(r, i);
+            }
+        }
+    }
+    let mut freed = 0;
+    for index in 0..SLOT_COUNT {
+        let slot = r.slot_ptr(index);
+        unsafe {
+            if (*slot).state == SLOT_USED && (*slot).pid != 0 && !pid_alive((*slot).pid) {
+                (*slot).state = SLOT_FREE;
+                (*slot).generation = (*slot).generation.wrapping_add(1);
+                wake_object(r, index);
+                freed += 1;
+            }
+        }
     }
     Ok(freed)
 }
