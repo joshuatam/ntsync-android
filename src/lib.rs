@@ -64,6 +64,17 @@ mod tests {
     }
 
     #[test]
+    fn handle_zero_is_never_allocated() {
+        setup();
+        // Handle 0 is the "no alert" sentinel in ntsync_wait_args.alert, so it
+        // must never be handed out: slot 0 is reserved at region init.
+        let h = create_event(false, false).unwrap();
+        assert_ne!(h & ((1 << 14) - 1), 0);
+        assert!(!close(0));
+        assert!(close(h));
+    }
+
+    #[test]
     fn semaphore_blocks_and_wakes() {
         setup();
         let h = create_semaphore(0, 1).unwrap();

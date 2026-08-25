@@ -40,7 +40,7 @@ use std::time::Duration;
 pub const MAX_WAIT_COUNT: usize = 64;
 
 const MAGIC: u64 = 0x6E7473796E635F75; // "ntsyc_u"
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 const SLOT_COUNT: u32 = 16384;
 const NODE_COUNT: u32 = 8192;
 const INDEX_BITS: u32 = 14; // log2(SLOT_COUNT)
@@ -48,7 +48,8 @@ const INDEX_MASK: u32 = (1 << INDEX_BITS) - 1;
 const NIL: u32 = u32::MAX;
 
 /// Resolve the region path: explicit argument, else $NTSYNC_SHM, else
-/// $TMPDIR/ntsync_userspace.shm (a ".vN" layout-version suffix is appended).
+/// $TMPDIR/ntsync_userspace.shm (the layout version is inserted before the
+/// ".shm" extension: ntsync_userspace.vN.shm).
 /// NTSYNC_SHM exists because in containerized
 /// setups (e.g. GameNative) wineserver and game processes run with different
 /// TMPDIRs and would otherwise mmap different files and never share objects.
@@ -73,6 +74,9 @@ const SLOT_USED: u32 = 1;
 const TYPE_SEM: u32 = 1;
 const TYPE_MUTEX: u32 = 2;
 const TYPE_EVENT: u32 = 3;
+/// Slot 0 is permanently reserved: handle 0 is the "no alert" sentinel in
+/// ntsync_wait_args.alert, so it must never be handed out as a real object.
+const TYPE_RESERVED: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -561,7 +565,12 @@ fn open_and_map(path: &str) -> Result<Region, i32> {
     // or zeroed in place - in-place mutation would SIGBUS/corrupt any process
     // that still has it mapped (e.g. a wineserver from an older build sharing
     // the path during a version transition).
-    let path = format!("{path}.v{VERSION}");
+    let path = match path.rsplit_once('.') {
+        // Keep .shm as the final extension; the layout version goes in the
+        // middle: ntsync_userspace.v7.shm
+        Some((stem, "shm")) => format!("{stem}.v{VERSION}.shm"),
+        _ => format!("{path}.v{VERSION}"),
+    };
     if debug_enabled() {
         debug_log(&format!("ntsync shm path: {path} (pid {})", std::process::id()));
     }
@@ -655,6 +664,12 @@ unsafe fn try_open_and_map(c_path: &CString) -> Result<Region, i32> {
             node.obj_prev = NIL;
             node.obj_next = NIL;
         }
+        // Reserve slot 0 (see TYPE_RESERVED). pid 0 keeps sweep_dead away.
+        let slot0 = &mut *region.slot_ptr(0);
+        slot0.waiter_head = NIL;
+        slot0.obj_type = TYPE_RESERVED;
+        slot0.pid = 0;
+        slot0.state = SLOT_USED;
     } else if region.header().magic != MAGIC
         || region.header().version != VERSION
         || region.header().capacity != SLOT_COUNT
@@ -673,7 +688,7 @@ unsafe fn try_open_and_map(c_path: &CString) -> Result<Region, i32> {
 static REGION: OnceLock<Result<Region, i32>> = OnceLock::new();
 
 /// Initialize (idempotently) with the shared-memory file at `path`.
-/// Called automatically with $TMPDIR/ntsync_userspace.shm.vN if the library
+/// Called automatically with $TMPDIR/ntsync_userspace.vN.shm if the library
 /// is used without an explicit init.
 pub fn init(path: Option<&str>) -> Result<(), Error> {
     debug_enabled(); // read NTSYNC_DEBUG and arm the watchdog/stats at startup
@@ -752,6 +767,9 @@ pub fn create_event(manual: bool, signaled: bool) -> Result<u32, Error> {
 }
 
 pub fn close(handle: u32) -> bool {
+    if handle & INDEX_MASK == 0 {
+        return false; // slot 0 is reserved (TYPE_RESERVED)
+    }
     let Ok(r) = region() else { return false };
     let Ok(_g) = r.lock_guard() else { return false };
     let Some(slot) = r.slot(handle) else { return false };
