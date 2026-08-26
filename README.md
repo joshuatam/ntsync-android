@@ -12,29 +12,45 @@ Intended to back the ntsync fast path of Proton/Wine's ntdll
 | Kernel ntsync                        | This library                                    |
 |--------------------------------------|-------------------------------------------------|
 | global object table (`ntsync_device`)| slot table in a file-backed shared mapping      |
-| `dev->wait_all_lock`                 | process-shared **robust** pthread mutex in shm  |
-| per-object wait queues + `wake_up_process` | futex `FUTEX_WAIT`/`FUTEX_WAKE` on a global generation counter in shm |
-| wake-then-recheck (`try_wake_any/all`) | waiters wake, take the lock, re-evaluate conditions |
+| `dev->wait_all_lock`                 | process-shared **robust** pthread mutex in shm (waiter registration/walks only; object state is lock-free CAS) |
+| per-object wait queues + `wake_up_process` | per-object intrusive waiter lists; each waiter sleeps on its own node futex word |
+| wake-then-recheck (`try_wake_any/all`) | waiters wake, re-evaluate conditions; wake walk is skipped entirely when the list is empty |
 | fd lifetime / close-on-death         | creator-pid tracking + `ntsync_sweep_dead()`    |
 | `get_task` owner-death check         | explicit `ntsync_mutex_kill` (same as kernel)   |
 
 The region is initialized on first use; the path is the `ntsync_init(path)`
-argument if given, else `$TMPDIR/ntsync_userspace.shm` (the caller is
-expected to export `TMPDIR`; Termux does this for every process, so all
-Wine processes automatically share the region). First opener creates and
-initializes the file under `flock`; later processes just `mmap` it.
-Capacity is 16384 objects (~0.5 MB).
+argument if given, else `$NTSYNC_SHM`, else `$TMPDIR/ntsync_userspace.shm`
+(the caller is expected to export `TMPDIR`; Termux does this for every
+process, so all Wine processes automatically share the region). First opener
+creates and initializes the file under `flock`; later processes just `mmap`
+it. Capacity is 16384 objects plus an 8192-entry shared waiter-node pool.
 
-The robust mutex protects all state transitions; if a process dies
-mid-operation the next locker gets `EOWNERDEAD` and marks the mutex
-consistent (all operations are small single-pass mutations, so recovery is
-safe).
+`NTSYNC_SHM` exists for containerized setups (e.g. GameNative) where
+wineserver and game processes run with different `TMPDIR`s and would
+otherwise not see the same region.
+
+Each slot's state (sem count, event flag, mutex owner/recursion/abandoned)
+is packed into a single `u64` mutated with lock-free CAS, so signal
+operations and already-signaled waits run without taking the region mutex.
+The robust mutex only protects waiter registration and wake walks; if a
+process dies mid-operation the next locker gets `EOWNERDEAD` and marks the
+mutex consistent.
+
+## Environment variables
+
+- `NTSYNC_SHM` — override the shared-region path.
+- `NTSYNC_DEBUG=1` — log to stderr, stdout and `$TMPDIR/ntsync_debug.log`
+  (the file is the reliable channel for in-game diagnostics); dump
+  per-process stats every 10 s (waits, fast-path hits, lock acquisitions,
+  wake walks, signal→scheduled wake latency `wake_lat_cnt/us_sum/us_max`);
+  emit a "stuck wait" dump with per-object state when a wait stalls.
 
 ## Layout
 
 - `src/core.rs` — shm object table + futex wait engine (unit-tested on host,
-  including a cross-process fork test)
+  including a cross-process fork test and `#[ignore]`d perf simulations)
 - `src/ffi.rs` — exported C ABI (`ntsync_*` functions)
+- `src/lib.rs` — tests and diagnostics glue
 - `include/ntsync_user.h` — C header (same struct layout as `<linux/ntsync.h>`)
 - `.cargo/config.toml` — `-z max-page-size=16384` linker flags for all Android
   targets (Google Play 16 KB page-size requirement)
@@ -68,6 +84,16 @@ ntsync_close(sem);
 
 Handles are plain integers — share them between processes however you like
 (shared memory, environment, your server protocol); no fd passing needed.
+Handle 0 is never handed out (slot 0 is reserved): it is the "no alert"
+sentinel in `ntsync_wait_args.alert`.
+
+### Region layout versioning
+
+The shm filename carries a `.vN` layout-version suffix
+(`ntsync_userspace.v7.shm`) so builds with different layouts never open the
+same region. A leftover stale file is unlinked and recreated — never
+truncated or zeroed in place, which would SIGBUS/corrupt processes from an
+older build that still have it mapped (old mappers keep their ghost inode).
 
 ### Semantic details (matching the kernel)
 
@@ -80,7 +106,12 @@ Handles are plain integers — share them between processes however you like
   mutex succeeds and the wait/read call returns `-EOWNERDEAD`.
 - Auto-reset events are consumed by one waiter; manual-reset events stay
   signaled until `ntsync_event_reset`; `ntsync_event_pulse` wakes all
-  current waiters and leaves the event unsignaled.
+  current waiters and leaves the event unsignaled. `ntsync_event_set` /
+  `_reset` / `_pulse` store the previous signaled state in `*prev` (if
+  non-NULL), like the kernel ioctls.
+- Alertable waits follow the kernel contract: if `alert` is nonzero it names
+  an event object that aborts the wait, which then returns success with
+  `index == count`.
 - `timeout == UINT64_MAX` waits indefinitely; otherwise it is an absolute
   ns deadline on `CLOCK_MONOTONIC` (or `CLOCK_REALTIME` with
   `NTSYNC_WAIT_REALTIME`).
@@ -93,8 +124,6 @@ Handles are plain integers — share them between processes however you like
 - Objects leaked by a crashing process are not freed automatically (no fd
   close hook in userspace). Run `ntsync_sweep_dead()` from a launcher or
   server process after a child exits.
-- Alertable waits are not supported (`alert` must be 0); Wine falls back to
-  a server-side wait when it needs them.
 - Waits are not signal-interruptible with `-ERESTARTSYS` semantics; `EINTR`
   wakes are absorbed and the wait resumes.
 
@@ -135,6 +164,9 @@ arm64-v8a / armeabi-v7a / x86_64 release libraries (API 28), verifies the
 
 ## Integrating with Proton
 
+The crate builds as `cdylib`, `rlib` and `staticlib`, so Wine can also
+static-link `libntsync_android.a` if a shared library is inconvenient.
+
 Link `libntsync_android.so` into the ntdll unix-side build (or `dlopen` it)
 and route the ntsync calls in `dlls/ntdll/unix/sync.c` to the `ntsync_*`
 functions instead of `ioctl(fd, NTSYNC_IOC_*, ...)`. Replace the fd table
@@ -147,6 +179,10 @@ the same region path see the same objects. After a process exits, call
 
 ```sh
 cargo test   # host-side unit tests, including a cross-process fork test
+
+# perf simulations (signaled-wait latency, signal churn, ping-pong wake
+# latency same-process and cross-process, contended mutex):
+cargo test --release -- --ignored --nocapture perf
 ```
 
 ## License
