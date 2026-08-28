@@ -342,13 +342,21 @@ impl Region {
         // Wine suspends threads with SIGUSR1; if it lands while we hold the
         // shared region mutex the holder stays parked and every process
         // (including wineserver) wedges on the lock. Defer it until release.
-        let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-        let mut block = unsafe { std::mem::zeroed::<libc::sigset_t>() };
-        unsafe {
-            libc::sigemptyset(&mut block);
-            libc::sigaddset(&mut block, libc::SIGUSR1);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old_mask);
-        }
+        // Consumers without a SIGUSR1 handler can set
+        // NTSYNC_NO_SIGUSR1_BLOCK=1 to skip the two pthread_sigmask
+        // syscalls per lock acquisition.
+        let old_mask = if sigusr1_block_enabled() {
+            let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            let mut block = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            unsafe {
+                libc::sigemptyset(&mut block);
+                libc::sigaddset(&mut block, libc::SIGUSR1);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old_mask);
+            }
+            Some(old_mask)
+        } else {
+            None
+        };
         let mut tries = 0u32;
         loop {
             tries += 1;
@@ -395,7 +403,11 @@ impl Region {
                 continue;
             }
             if ret != libc::EINTR {
-                unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut()) };
+                if let Some(old_mask) = old_mask {
+                    unsafe {
+                        libc::pthread_sigmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut())
+                    };
+                }
                 return Err(-ret);
             }
         }
@@ -404,7 +416,7 @@ impl Region {
 
 struct RegionGuard<'a> {
     region: &'a Region,
-    old_mask: libc::sigset_t,
+    old_mask: Option<libc::sigset_t>,
 }
 
 impl Drop for RegionGuard<'_> {
@@ -415,7 +427,9 @@ impl Drop for RegionGuard<'_> {
             (*h).lock_owner_tid = 0;
             let lock = &(*h).lock as *const libc::pthread_mutex_t as *mut _;
             libc::pthread_mutex_unlock(lock);
-            libc::pthread_sigmask(libc::SIG_SETMASK, &self.old_mask, std::ptr::null_mut());
+            if let Some(old_mask) = &self.old_mask {
+                libc::pthread_sigmask(libc::SIG_SETMASK, old_mask, std::ptr::null_mut());
+            }
         }
     }
 }
@@ -1187,6 +1201,20 @@ fn debug_enabled() -> bool {
             stats_dump_loop();
         }
         on
+    })
+}
+
+/// Whether to defer SIGUSR1 around region-lock acquisitions (default on).
+/// Only needed when the host process installs a SIGUSR1 handler that can
+/// suspend threads (Wine's thread-suspend machinery); everything else can
+/// set NTSYNC_NO_SIGUSR1_BLOCK=1 to skip the two pthread_sigmask syscalls
+/// per lock acquisition.
+fn sigusr1_block_enabled() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        std::env::var_os("NTSYNC_NO_SIGUSR1_BLOCK")
+            .map(|v| v.is_empty() || v == "0")
+            .unwrap_or(true)
     })
 }
 

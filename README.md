@@ -39,6 +39,14 @@ mutex consistent.
 ## Environment variables
 
 - `NTSYNC_SHM` — override the shared-region path.
+- `NTSYNC_NO_SIGUSR1_BLOCK=1` — skip the SIGUSR1 deferral around
+  region-lock acquisitions. By default the library blocks SIGUSR1 while
+  holding the shared region mutex (two `pthread_sigmask` syscalls per
+  acquisition): Wine suspends threads with SIGUSR1, and a thread parked
+  while holding the mutex would wedge every process on the region. Only
+  set this when the host process never installs a SIGUSR1 handler (i.e.
+  not under Wine); it measurably reduces lock-path CPU under contention
+  (~13% per-op in the multi-process benchmark).
 - `NTSYNC_DEBUG=1` — log to stderr, stdout and `$TMPDIR/ntsync_debug.log`
   (the file is the reliable channel for in-game diagnostics); dump
   per-process stats every 10 s (waits, fast-path hits, lock acquisitions,
