@@ -185,6 +185,48 @@ cargo test   # host-side unit tests, including a cross-process fork test
 cargo test --release -- --ignored --nocapture perf
 ```
 
+## Benchmarks (CPU/memory regression baseline)
+
+`src/bench.rs` simulates a real Wine workload (render thread with frame
+pacing, thread-pool workers on job semaphores, contended device mutex,
+object create/close churn, alertable APC-style waits,
+MsgWaitForMultipleObjects-style multi-waits, cross-process
+wineserver↔client ping-pong, a 4-process contention test on the shared
+region, and an exec-based variant where each child process independently
+opens/mmaps the region like a fresh Wine process, reporting its own shm
+RSS) and profiles it with `getrusage` (CPU time,
+context switches) and `/proc/self/smaps` (shm file size, mapped RSS, dirty
+pages). Use it to validate that an optimization actually reduces CPU or
+file-I/O without regressing anything else:
+
+```sh
+# 1. Before changing code: record the baseline.
+NTSYNC_BENCH_BASELINE=write cargo test --release -- --ignored --nocapture --test-threads=1 bench
+
+# 2. After changing code: run again; every metric is printed next to its
+#    baseline value with a delta (REGRESSED = >20% worse).
+cargo test --release -- --ignored --nocapture --test-threads=1 bench
+
+# 3. Optionally make regressions fail the run:
+NTSYNC_BENCH_STRICT=1 cargo test --release -- --ignored --nocapture --test-threads=1 bench
+```
+
+Baselines live in `target/ntsync-bench-baseline.json`; the latest run is
+always in `target/ntsync-bench-latest.json`. All metrics are
+lower-is-better (`cpu_ns_per_op`, `voluntary_ctxsw`, `shm_rss_kb_*`, ...).
+Benches serialize on a global lock because rusage/RSS are process-wide;
+always pass `--test-threads=1` for comparable numbers, and compare only
+baselines recorded on the same machine.
+
+Current baseline facts this suite pins down: the shm region is
+983,120 B (~960 KiB: 16384 slots x 40 B + 8192 waiter nodes x 40 B), and
+because init eagerly zeroes and node-links the whole file, its mapped RSS
+is the full ~976 kB from the first byte written. The signaled-wait fast
+path takes zero voluntary context switches (no syscalls). Attaching
+processes (bench_6) pay almost none of that: a fresh exec'd worker maps
+only ~140 kB of the region while running the full workload, so the eager
+init cost falls entirely on the creating process today.
+
 ## License
 
 Copyright (C) 2026 Joshua Tam <297250+joshuatam@users.noreply.github.com>

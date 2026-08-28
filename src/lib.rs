@@ -19,6 +19,9 @@
 pub mod core;
 pub mod ffi;
 
+#[cfg(test)]
+mod bench;
+
 pub use core::{Error, WaitOutcome, MAX_WAIT_COUNT};
 
 #[cfg(test)]
