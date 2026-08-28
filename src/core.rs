@@ -40,7 +40,7 @@ use std::time::Duration;
 pub const MAX_WAIT_COUNT: usize = 64;
 
 const MAGIC: u64 = 0x6E7473796E635F75; // "ntsyc_u"
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 const SLOT_COUNT: u32 = 16384;
 const NODE_COUNT: u32 = 8192;
 const INDEX_BITS: u32 = 14; // log2(SLOT_COUNT)
@@ -162,6 +162,11 @@ struct Header {
     node_capacity: u32,
     /// Free-list head for the waiter node pool (linked via waiter_next).
     node_free_head: u32,
+    /// Lazy pool: index of the first never-handed-out node. Nodes below
+    /// this cursor are either in use or on the free list; nodes at or above
+    /// it have never been touched, so their pages stay untouched (sparse
+    /// zero pages) until actually needed. Caller holds the lock.
+    node_fresh: u32,
     /// Allocation cursor.
     next_scan: u32,
     /// Debug: which thread currently holds `lock` (0 = none). Written after
@@ -445,16 +450,28 @@ fn futex_wake(addr: *const AtomicU32) {
     }
 }
 
-/// Pop a node from the free list. Caller holds the lock.
+/// Pop a node from the free list, or hand out a never-before-used node
+/// from the lazy pool. Caller holds the lock.
 fn node_alloc(r: &Region) -> Option<u32> {
     let head = r.header().node_free_head;
-    if head == NIL {
-        return None;
-    }
-    let node = r.node_ptr(head);
-    let next = unsafe { (*node).waiter_next };
+    let idx = if head != NIL {
+        let node = r.node_ptr(head);
+        let next = unsafe { (*node).waiter_next };
+        unsafe { (*(r.base as *mut Header)).node_free_head = next };
+        head
+    } else {
+        // Free list empty: consume a fresh node. Its memory is a sparse
+        // zero page (never written since region creation), so seq = 0,
+        // registered = 0 — exactly the state a recycled node is reset to.
+        let fresh = r.header().node_fresh;
+        if fresh >= NODE_COUNT {
+            return None;
+        }
+        unsafe { (*(r.base as *mut Header)).node_fresh = fresh + 1 };
+        fresh
+    };
+    let node = r.node_ptr(idx);
     unsafe {
-        (*(r.base as *mut Header)).node_free_head = next;
         (*node).registered = 0;
         (*node).obj = NIL;
         (*node).wait_word = NIL;
@@ -463,7 +480,7 @@ fn node_alloc(r: &Region) -> Option<u32> {
         (*node).waiter_next = NIL;
         (*node).pid = std::process::id();
     }
-    Some(head)
+    Some(idx)
 }
 
 /// Return a node to the free list. Caller holds the lock; the node must
@@ -641,7 +658,14 @@ unsafe fn try_open_and_map(c_path: &CString) -> Result<Region, i32> {
     }
     let region = Region { base: base as *mut u8 };
     if need_init {
-        std::ptr::write_bytes(base, 0, region_size());
+        // No bulk zeroing: a freshly ftruncate'd file reads as zeros, and
+        // leaving the pages untouched keeps them sparse - no page-cache
+        // allocation, no flash writeback for the ~960 KiB nobody may ever
+        // use. Only the header and the reserved slot 0 are written; waiter
+        // nodes come from the lazy pool (header.node_fresh), so the node
+        // area needs no initialization at all. Zeroed memory gives every
+        // slot SLOT_FREE/generation 0 and every node seq 0/registered 0,
+        // which is exactly the state the recycling paths reset to.
         let header = &mut *(base as *mut Header);
         let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
         libc::pthread_mutexattr_init(&mut attr);
@@ -653,17 +677,9 @@ unsafe fn try_open_and_map(c_path: &CString) -> Result<Region, i32> {
         header.version = VERSION;
         header.capacity = SLOT_COUNT;
         header.node_capacity = NODE_COUNT;
-        header.node_free_head = 0;
+        header.node_free_head = NIL;
+        header.node_fresh = 0;
         header.next_scan = 0;
-        for i in 0..NODE_COUNT {
-            let node = &mut *region.node_ptr(i);
-            node.waiter_next = if i + 1 < NODE_COUNT { i + 1 } else { NIL };
-            node.registered = 0;
-            node.obj = NIL;
-            node.wait_word = NIL;
-            node.obj_prev = NIL;
-            node.obj_next = NIL;
-        }
         // Reserve slot 0 (see TYPE_RESERVED). pid 0 keeps sweep_dead away.
         let slot0 = &mut *region.slot_ptr(0);
         slot0.waiter_head = NIL;
@@ -1529,7 +1545,10 @@ pub fn sweep_dead() -> Result<u32, Error> {
         !(ret != 0 && errno() == libc::ESRCH)
     };
     // Purge nodes of dead waiters first so freed objects have empty lists.
-    for i in 0..NODE_COUNT {
+    // Only nodes below node_fresh were ever handed out; the rest have
+    // never been touched (registered == 0 by virtue of sparse zero pages).
+    let node_hi = r.header().node_fresh.min(NODE_COUNT);
+    for i in 0..node_hi {
         let node = r.node_ptr(i);
         unsafe {
             if (*node).registered != 0 && !pid_alive((*node).pid) {
