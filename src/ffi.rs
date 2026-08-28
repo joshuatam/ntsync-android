@@ -91,7 +91,12 @@ fn timeout_to_duration(timeout: u64, flags: u32) -> Option<Duration> {
     Some(Duration::from_nanos(timeout.saturating_sub(now)))
 }
 
-unsafe fn read_wait(args: *const ntsync_wait_args) -> Result<(Vec<u32>, u32, u32, Option<Duration>), i32> {
+/// Read the wait arguments into a stack buffer (no heap allocation on the
+/// wait path; `count` is capped at NTSYNC_MAX_WAIT_COUNT == 64).
+unsafe fn read_wait(
+    args: *const ntsync_wait_args,
+    handles: &mut [u32; NTSYNC_MAX_WAIT_COUNT as usize],
+) -> Result<(usize, u32, u32, Option<Duration>), i32> {
     let args = unsafe { args.as_ref() }.ok_or(-EFAULT)?;
     if args.count == 0 || args.count > NTSYNC_MAX_WAIT_COUNT {
         return Err(-EINVAL);
@@ -100,10 +105,10 @@ unsafe fn read_wait(args: *const ntsync_wait_args) -> Result<(Vec<u32>, u32, u32
     if objs.is_null() {
         return Err(-EFAULT);
     }
-    let handles: Vec<u32> =
-        unsafe { std::slice::from_raw_parts(objs, args.count as usize) }.to_vec();
+    let count = args.count as usize;
+    handles[..count].copy_from_slice(unsafe { std::slice::from_raw_parts(objs, count) });
     let timeout = timeout_to_duration(args.timeout, args.flags);
-    Ok((handles, args.owner, args.alert, timeout))
+    Ok((count, args.owner, args.alert, timeout))
 }
 
 /// Initialize the shared region. `path` may be NULL to use
@@ -349,14 +354,16 @@ unsafe fn do_wait(args: *mut ntsync_wait_args, all: bool) -> i32 {
     if args.is_null() {
         return -EFAULT;
     }
-    let (handles, owner, alert, timeout) = match unsafe { read_wait(args) } {
+    let mut handles = [0u32; NTSYNC_MAX_WAIT_COUNT as usize];
+    let (count, owner, alert, timeout) = match unsafe { read_wait(args, &mut handles) } {
         Ok(v) => v,
         Err(e) => return e,
     };
+    let handles = &handles[..count];
     let outcome = if all {
-        core::wait_all(&handles, owner, timeout, alert)
+        core::wait_all(handles, owner, timeout, alert)
     } else {
-        core::wait_any(&handles, owner, timeout, alert)
+        core::wait_any(handles, owner, timeout, alert)
     };
     match outcome {
         WaitOutcome::Signaled { index, owner_dead } => {

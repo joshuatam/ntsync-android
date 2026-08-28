@@ -459,8 +459,9 @@ fn futex_wait(addr: *const AtomicU32, expected: u32, timeout: Option<Duration>) 
 }
 
 fn futex_wake(addr: *const AtomicU32) {
+    // Each head node is slept on by exactly one waiter, so wake one.
     unsafe {
-        libc::syscall(libc::SYS_futex, addr as *const u32, libc::FUTEX_WAKE, i32::MAX, 0, 0, 0);
+        libc::syscall(libc::SYS_futex, addr as *const u32, libc::FUTEX_WAKE, 1, 0, 0, 0);
     }
 }
 
@@ -554,6 +555,7 @@ fn node_register(r: &Region, idx: u32, obj_idx: u32, wait_word: u32) {
 /// Caller holds the lock. Each waiter is detached and its head seq bumped;
 /// it re-checks conditions when scheduled.
 fn wake_object(r: &Region, obj_idx: u32) {
+    let debug = debug_enabled();
     let slot = r.slot_ptr(obj_idx);
     let mut idx = unsafe { (*slot).waiter_head };
     while idx != NIL {
@@ -562,7 +564,9 @@ fn wake_object(r: &Region, obj_idx: u32) {
         node_detach(r, idx);
         let head = r.node_ptr(word);
         unsafe {
-            (*head).wake_ts.store(monotonic_ns(), Ordering::Relaxed);
+            if debug {
+                (*head).wake_ts.store(monotonic_ns(), Ordering::Relaxed);
+            }
             (*head).seq.fetch_add(1, Ordering::Release);
             futex_wake(&(*head).seq);
         }
@@ -1267,8 +1271,44 @@ pub fn wait_all(handles: &[u32], owner: u32, timeout: Option<Duration>, alert: u
     wait(handles, owner, timeout, true, alert)
 }
 
+/// Fixed-capacity stack set of waiter node indices: up to MAX_WAIT_COUNT
+/// object nodes plus one alert node. Replaces a per-wait heap Vec.
+struct NodeSet {
+    idx: [u32; MAX_WAIT_COUNT + 1],
+    len: usize,
+}
+
+impl NodeSet {
+    fn new() -> Self {
+        NodeSet {
+            idx: [0; MAX_WAIT_COUNT + 1],
+            len: 0,
+        }
+    }
+    fn push(&mut self, v: u32) {
+        self.idx[self.len] = v;
+        self.len += 1;
+    }
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+    fn iter(&self) -> std::slice::Iter<'_, u32> {
+        self.idx[..self.len].iter()
+    }
+}
+
+impl std::ops::Index<usize> for NodeSet {
+    type Output = u32;
+    fn index(&self, i: usize) -> &u32 {
+        &self.idx[i]
+    }
+}
+
 /// Detach and free all nodes of a waiter (caller holds the lock).
-fn waiter_cleanup(r: &Region, nodes: &mut Vec<u32>) {
+fn waiter_cleanup(r: &Region, nodes: &mut NodeSet) {
     for &idx in nodes.iter() {
         node_detach(r, idx);
     }
@@ -1299,18 +1339,21 @@ fn try_satisfy(
         }
         None
     } else {
-        // Acquire one by one; roll back if any object is busy.
-        let mut acquired: Vec<(usize, bool)> = Vec::with_capacity(handles.len());
+        // Acquire one by one; roll back if any object is busy. Stack array:
+        // handles.len() <= MAX_WAIT_COUNT, so no heap allocation.
+        let mut acquired = [(0usize, false); MAX_WAIT_COUNT];
+        let mut n_acquired = 0usize;
         let mut owner_dead = false;
         for (i, h) in handles.iter().enumerate() {
             let slot = unsafe { &*r.slot_ptr(h & INDEX_MASK) };
             match try_acquire(slot, owner, entry_seqs[i]) {
                 Some(od) => {
                     owner_dead |= od;
-                    acquired.push((i, od));
+                    acquired[n_acquired] = (i, od);
+                    n_acquired += 1;
                 }
                 None => {
-                    for &(j, od) in &acquired {
+                    for &(j, od) in &acquired[..n_acquired] {
                         rollback_acquire(
                             unsafe { &*r.slot_ptr(handles[j] & INDEX_MASK) },
                             owner,
@@ -1347,7 +1390,7 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
 
     let mut entry_seqs = [0u64; MAX_WAIT_COUNT];
     let n_nodes = handles.len() + (alert != 0) as usize;
-    let mut nodes: Vec<u32> = Vec::with_capacity(n_nodes);
+    let mut nodes = NodeSet::new();
 
     // ---- Fast path: validate and try to acquire without any lock. ----
     let fast_valid = handles.iter().enumerate().all(|(i, h)| {
@@ -1514,7 +1557,7 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
 
         stat_bump(3); // futex_sleeps
         let ret = futex_wait(unsafe { &(*r.node_ptr(head)).seq }, seq, slice);
-        if ret == 0 {
+        if ret == 0 && debug {
             // Woken by a signaler: measure signal-to-running latency.
             let head_node = unsafe { &*r.node_ptr(head) };
             let ts = head_node.wake_ts.load(Ordering::Relaxed);

@@ -226,14 +226,11 @@ Benches serialize on a global lock because rusage/RSS are process-wide;
 always pass `--test-threads=1` for comparable numbers, and compare only
 baselines recorded on the same machine.
 
-Current baseline facts this suite pins down: the shm region is
-983,120 B (~960 KiB: 16384 slots x 40 B + 8192 waiter nodes x 40 B), and
-because init eagerly zeroes and node-links the whole file, its mapped RSS
-is the full ~976 kB from the first byte written. The signaled-wait fast
-path takes zero voluntary context switches (no syscalls). Attaching
-processes (bench_6) pay almost none of that: a fresh exec'd worker maps
-only ~140 kB of the region while running the full workload, so the eager
-init cost falls entirely on the creating process today.
+Current facts this suite pins down: the shm region file is
+983,120 B (~960 KiB: 16384 slots x 40 B + 8192 waiter nodes x 40 B), but
+thanks to lazy init it starts sparse — ~16 kB mapped RSS at init,
+growing only as objects and waiters actually arrive. The signaled-wait
+fast path takes zero voluntary context switches (no syscalls).
 
 ## License
 

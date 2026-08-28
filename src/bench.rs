@@ -810,7 +810,9 @@ fn bench_6_multi_process_exec() {
     let _lock = BENCH_LOCK.lock().unwrap();
     let bench = "multi_process_exec";
     const PROCS: u32 = 4;
-    const ITERS: u64 = 2_000;
+    // Longer than the fork bench: amortizes exec/dynamic-linker startup
+    // noise, which otherwise dominates the per-op numbers.
+    const ITERS: u64 = 6_000;
     const OPS_PER_ITER: u64 = 6;
 
     let start = create_event(true, false).unwrap();
