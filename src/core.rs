@@ -40,7 +40,7 @@ use std::time::Duration;
 pub const MAX_WAIT_COUNT: usize = 64;
 
 const MAGIC: u64 = 0x6E7473796E635F75; // "ntsyc_u"
-const VERSION: u32 = 8;
+const VERSION: u32 = 9;
 const SLOT_COUNT: u32 = 16384;
 const NODE_COUNT: u32 = 8192;
 const INDEX_BITS: u32 = 14; // log2(SLOT_COUNT)
@@ -169,6 +169,8 @@ struct Header {
     node_fresh: u32,
     /// Allocation cursor.
     next_scan: u32,
+    /// CLOCK_MONOTONIC ns of the last auto-sweep completion (atomic).
+    sweep_ns: u64,
     /// Debug: which thread currently holds `lock` (0 = none). Written after
     /// acquiring, cleared before releasing; only meaningful while locked.
     lock_owner_pid: u32,
@@ -698,6 +700,7 @@ unsafe fn try_open_and_map(c_path: &CString) -> Result<Region, i32> {
         header.node_free_head = NIL;
         header.node_fresh = 0;
         header.next_scan = 0;
+        header.sweep_ns = 0;
         // Reserve slot 0 (see TYPE_RESERVED). pid 0 keeps sweep_dead away.
         let slot0 = &mut *region.slot_ptr(0);
         slot0.waiter_head = NIL;
@@ -776,7 +779,7 @@ pub fn create_semaphore(count: u32, max: u32) -> Result<u32, Error> {
     }
     let r = region()?;
     let _g = r.lock_guard().map_err(Error::Init)?;
-    let handle = alloc_slot(r).ok_or(Error::Init(libc::ENOMEM))?;
+    let handle = alloc_slot_or_sweep(r).ok_or(Error::Init(libc::ENOMEM))?;
     unsafe { slot_publish(r, handle, TYPE_SEM, pack_sem(count, max)) };
     Ok(handle)
 }
@@ -787,7 +790,7 @@ pub fn create_mutex(owner: u32, count: u32) -> Result<u32, Error> {
     }
     let r = region()?;
     let _g = r.lock_guard().map_err(Error::Init)?;
-    let handle = alloc_slot(r).ok_or(Error::Init(libc::ENOMEM))?;
+    let handle = alloc_slot_or_sweep(r).ok_or(Error::Init(libc::ENOMEM))?;
     unsafe { slot_publish(r, handle, TYPE_MUTEX, pack_mutex(owner, count, false)) };
     Ok(handle)
 }
@@ -795,7 +798,7 @@ pub fn create_mutex(owner: u32, count: u32) -> Result<u32, Error> {
 pub fn create_event(manual: bool, signaled: bool) -> Result<u32, Error> {
     let r = region()?;
     let _g = r.lock_guard().map_err(Error::Init)?;
-    let handle = alloc_slot(r).ok_or(Error::Init(libc::ENOMEM))?;
+    let handle = alloc_slot_or_sweep(r).ok_or(Error::Init(libc::ENOMEM))?;
     unsafe { slot_publish(r, handle, TYPE_EVENT, pack_event(signaled, manual)) };
     Ok(handle)
 }
@@ -822,6 +825,7 @@ pub fn close(handle: u32) -> bool {
 /// On overflow the state is left unchanged (kernel: -EOVERFLOW). Lock-free.
 pub fn sem_release(handle: u32, count: u32) -> Result<u32, Error> {
     let r = region()?;
+    auto_sweep_dead(r);
     let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_SEM).ok_or(Error::Invalid)?;
     let w0 = unsafe { &(*slot).w0 };
     loop {
@@ -845,6 +849,7 @@ pub fn sem_release(handle: u32, count: u32) -> Result<u32, Error> {
 pub fn event_set(handle: u32) -> Result<u32, Error> {
     stat_bump(7);
     let r = region()?;
+    auto_sweep_dead(r);
     let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_EVENT).ok_or(Error::Invalid)?;
     let w0 = unsafe { &(*slot).w0 };
     loop {
@@ -866,6 +871,7 @@ pub fn event_set(handle: u32) -> Result<u32, Error> {
 pub fn event_reset(handle: u32) -> Result<u32, Error> {
     stat_bump(7);
     let r = region()?;
+    auto_sweep_dead(r);
     let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_EVENT).ok_or(Error::Invalid)?;
     let w0 = unsafe { &(*slot).w0 };
     loop {
@@ -886,6 +892,7 @@ pub fn event_pulse(handle: u32) -> Result<u32, Error> {
     // do it under the region lock, like the kernel's pulse under
     // wait_all_lock.
     let r = region()?;
+    auto_sweep_dead(r);
     let _g = r.lock_guard().map_err(Error::Init)?;
     let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_EVENT).ok_or(Error::Invalid)?;
     let prev = unsafe {
@@ -908,6 +915,7 @@ pub fn mutex_unlock(handle: u32, owner: u32) -> Result<u32, Error> {
         return Err(Error::Invalid);
     }
     let r = region()?;
+    auto_sweep_dead(r);
     let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_MUTEX).ok_or(Error::Invalid)?;
     let w0 = unsafe { &(*slot).w0 };
     loop {
@@ -1252,8 +1260,9 @@ fn debug_dump_stuck_wait(
                     let s = &*slot;
                     let locked = is_locked(s, owner, ld64(&s.d));
                     debug_log(&format!(
-                        "  {:#010x} {} state={} w0={:#x} d={} pid={} gen={} waiters={} now_signaled={}",
-                        h, type_name(s.obj_type), s.state, ld64(&s.w0), ld64(&s.d), s.pid, s.generation,
+                        "  {:#010x} {} state={} w0={:#x} d={} pid={} pid_alive={} gen={} waiters={} now_signaled={}",
+                        h, type_name(s.obj_type), s.state, ld64(&s.w0), ld64(&s.d), s.pid,
+                        pid_alive(s.pid), s.generation,
                         s.waiter_head != NIL, locked,
                     ));
                 },
@@ -1575,6 +1584,12 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
                 // not decide here. Fall through to detach + loop, where the
                 // locked section re-attempts the acquire authoritatively
                 // before the deadline check returns Timeout.
+                //
+                // Also a good moment for an opportunistic sweep: a wait that
+                // keeps timing out may be blocked on an object whose creator
+                // process died (the kernel driver reaps those via fd release;
+                // userspace must scan). Rate-limited region-wide.
+                auto_sweep_dead(r);
                 if debug && deadline.is_none_or(|dl| std::time::Instant::now() < dl) && last_dump.elapsed() >= Duration::from_secs(5) {
                     debug_dump_stuck_wait(r, handles, owner, alert, all, start);
                     last_dump = std::time::Instant::now();
@@ -1605,16 +1620,17 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
 /// waiter nodes left behind by dead waiters. Userspace has no fd-close-on-
 /// death hook, so callers (e.g. a launcher or wineserver replacement)
 /// should run this after a process exits.
-pub fn sweep_dead() -> Result<u32, Error> {
-    let r = region()?;
-    let _g = r.lock_guard().map_err(Error::Init)?;
-    let pid_alive = |pid: u32| -> bool {
-        if pid == 0 {
-            return false;
-        }
-        let ret = unsafe { libc::kill(pid as i32, 0) };
-        !(ret != 0 && errno() == libc::ESRCH)
-    };
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let ret = unsafe { libc::kill(pid as i32, 0) };
+    !(ret != 0 && errno() == libc::ESRCH)
+}
+
+/// Body of sweep_dead with the region lock already held. Returns the
+/// number of objects freed.
+fn sweep_dead_locked(r: &Region) -> u32 {
     // Purge nodes of dead waiters first so freed objects have empty lists.
     // Only nodes below node_fresh were ever handed out; the rest have
     // never been touched (registered == 0 by virtue of sparse zero pages).
@@ -1639,5 +1655,89 @@ pub fn sweep_dead() -> Result<u32, Error> {
             }
         }
     }
-    Ok(freed)
+    freed
+}
+
+/// How often the library runs sweep_dead() opportunistically on its own.
+/// The kernel driver reaps a dead process's objects via fd release;
+/// userspace has no such hook, so without this a crashed process's
+/// objects linger until some caller runs ntsync_sweep_dead().
+/// NTSYNC_SWEEP_INTERVAL_SEC overrides the 30 s default; 0 disables.
+fn sweep_interval_ns() -> u64 {
+    static INTERVAL: OnceLock<u64> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        let secs = std::env::var("NTSYNC_SWEEP_INTERVAL_SEC")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        secs * 1_000_000_000
+    })
+}
+
+/// Rate-limited, region-wide opportunistic sweep. Called from signal ops
+/// and from the wait timeout path. Costs ~1ns in the common case: a
+/// process-local counter gates the (vDSO, ~20ns) clock read to every
+/// 256th call, and the region-wide interval check is then one relaxed
+/// atomic load. The region lock serializes concurrent sweepers; sweep_ns
+/// is re-checked under it.
+fn auto_sweep_dead(r: &Region) {
+    // Thread-local counter: ~1ns per call, no cacheline sharing. Sweep
+    // promptness is unaffected: under any real load 256 signal ops pass
+    // in microseconds, and idle threads don't need to sweep.
+    thread_local! {
+        static CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    let n = CALLS.get();
+    CALLS.set(n + 1);
+    if n & 0xFF != 0 {
+        return;
+    }
+    let interval = sweep_interval_ns();
+    if interval == 0 {
+        return;
+    }
+    let cell = unsafe { &*(&r.header().sweep_ns as *const u64 as *const AtomicU64) };
+    let now = monotonic_ns();
+    if now.saturating_sub(cell.load(Ordering::Relaxed)) < interval {
+        return;
+    }
+    if let Ok(_g) = r.lock_guard() {
+        let now = monotonic_ns();
+        if now.saturating_sub(cell.load(Ordering::Relaxed)) < interval {
+            return; // another process just swept
+        }
+        let freed = sweep_dead_locked(r);
+        cell.store(now, Ordering::Release);
+        if freed > 0 && debug_enabled() {
+            debug_log(&format!("auto-sweep freed {freed} dead objects"));
+        }
+    }
+}
+
+/// alloc_slot, but on a full table reap dead processes' objects first and
+/// retry once. Caller holds the region lock.
+fn alloc_slot_or_sweep(r: &Region) -> Option<u32> {
+    alloc_slot(r).or_else(|| {
+        if sweep_dead_locked(r) > 0 {
+            alloc_slot(r)
+        } else {
+            None
+        }
+    })
+}
+
+pub fn sweep_dead() -> Result<u32, Error> {
+    let r = region()?;
+    let _g = r.lock_guard().map_err(Error::Init)?;
+    Ok(sweep_dead_locked(r))
+}
+
+/// Tests: force the auto-sweep rate limiter to consider the interval
+/// elapsed, so the next signal op sweeps regardless of wall time.
+#[cfg(test)]
+pub(crate) fn test_reset_sweep_clock() {
+    if let Ok(r) = region() {
+        let cell = unsafe { &*(&r.header().sweep_ns as *const u64 as *const AtomicU64) };
+        cell.store(0, Ordering::Release);
+    }
 }

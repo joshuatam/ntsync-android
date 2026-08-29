@@ -51,7 +51,16 @@ mutex consistent.
   (the file is the reliable channel for in-game diagnostics); dump
   per-process stats every 10 s (waits, fast-path hits, lock acquisitions,
   wake walks, signal→scheduled wake latency `wake_lat_cnt/us_sum/us_max`);
-  emit a "stuck wait" dump with per-object state when a wait stalls.
+  emit a "stuck wait" dump with per-object state (including creator pid
+  liveness) when a wait stalls.
+- `NTSYNC_SWEEP_INTERVAL_SEC` — auto-sweep cadence for dead-process
+  cleanup, default 30. The kernel driver reaps a dead process's objects
+  via fd release; userspace has no such hook, so the library runs the
+  `ntsync_sweep_dead()` cleanup on its own, rate-limited region-wide:
+  signal ops and wait timeouts check a shared timestamp (a thread-local
+  counter gates the check, ~1 ns/op), and slot allocation on a full
+  table always sweeps first. `0` disables auto-sweeping (explicit
+  `ntsync_sweep_dead()` still works).
 
 ## Layout
 

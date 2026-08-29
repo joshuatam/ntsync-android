@@ -302,6 +302,27 @@ mod tests {
         assert!(read_event(h).is_ok());
         assert!(close(h));
     }
+
+    #[test]
+    fn auto_sweep_reaps_dead_creator() {
+        setup();
+        let mine = create_event(false, false).unwrap();
+        // A child process creates an object and dies without closing it.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let _ = create_event(false, false).unwrap();
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        // The orphan exists: an explicit sweep would find it. Instead, an
+        // ordinary signal op must reap it via the auto-sweep path.
+        test_reset_sweep_clock();
+        event_set(mine).unwrap();
+        assert_eq!(sweep_dead().unwrap(), 0, "auto-sweep should have reaped the orphan");
+        assert!(close(mine));
+    }
 }
 
 /// Performance simulation of the paths Wine's ntdll exercises. Not run by
