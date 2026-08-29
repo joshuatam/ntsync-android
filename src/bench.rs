@@ -883,7 +883,7 @@ fn bench_6_multi_process_exec() {
     // Reap and collect each worker's reported shm RSS.
     let mut worker_rss = Vec::new();
     let mut worker_logs = String::new();
-    for mut ch in children {
+    for ch in children {
         let out = ch.wait_with_output().unwrap();
         worker_logs.push_str(&String::from_utf8_lossy(&out.stdout));
         assert!(out.status.success(), "worker failed: {out:?}");
