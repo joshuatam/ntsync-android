@@ -745,16 +745,29 @@ fn region() -> Result<&'static Region, Error> {
     }
 }
 
+/// next_scan high bit: set once the allocation cursor has wrapped around
+/// the table. Until then, slots at or above the cursor have never been
+/// handed out (sparse zero pages), so sweep_dead must not read them —
+/// scanning the whole table would fault ~640 KB of untouched slot pages
+/// into RSS and defeat the lazy-init layout.
+const SCAN_WRAPPED: u32 = 0x8000_0000;
+
 fn alloc_slot(r: &Region) -> Option<u32> {
     // Caller holds the lock.
     let header = r.header();
+    let cursor = header.next_scan & !SCAN_WRAPPED;
     for i in 0..SLOT_COUNT {
-        let index = (header.next_scan + i) % SLOT_COUNT;
+        let index = (cursor + i) % SLOT_COUNT;
         let slot = r.slot_ptr(index);
         unsafe {
             if (*slot).state == SLOT_FREE {
                 (*slot).waiter_head = NIL;
-                (*(r.base as *mut Header)).next_scan = (index + 1) % SLOT_COUNT;
+                let next = (index + 1) % SLOT_COUNT;
+                let mut flags = header.next_scan & SCAN_WRAPPED;
+                if next == 0 {
+                    flags = SCAN_WRAPPED; // cursor wrapped: table fully seen
+                }
+                (*(r.base as *mut Header)).next_scan = next | flags;
                 return Some(((*slot).generation << INDEX_BITS) | index);
             }
         }
@@ -825,7 +838,6 @@ pub fn close(handle: u32) -> bool {
 /// On overflow the state is left unchanged (kernel: -EOVERFLOW). Lock-free.
 pub fn sem_release(handle: u32, count: u32) -> Result<u32, Error> {
     let r = region()?;
-    auto_sweep_dead(r);
     let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_SEM).ok_or(Error::Invalid)?;
     let w0 = unsafe { &(*slot).w0 };
     loop {
@@ -849,7 +861,6 @@ pub fn sem_release(handle: u32, count: u32) -> Result<u32, Error> {
 pub fn event_set(handle: u32) -> Result<u32, Error> {
     stat_bump(7);
     let r = region()?;
-    auto_sweep_dead(r);
     let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_EVENT).ok_or(Error::Invalid)?;
     let w0 = unsafe { &(*slot).w0 };
     loop {
@@ -871,7 +882,6 @@ pub fn event_set(handle: u32) -> Result<u32, Error> {
 pub fn event_reset(handle: u32) -> Result<u32, Error> {
     stat_bump(7);
     let r = region()?;
-    auto_sweep_dead(r);
     let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_EVENT).ok_or(Error::Invalid)?;
     let w0 = unsafe { &(*slot).w0 };
     loop {
@@ -892,7 +902,6 @@ pub fn event_pulse(handle: u32) -> Result<u32, Error> {
     // do it under the region lock, like the kernel's pulse under
     // wait_all_lock.
     let r = region()?;
-    auto_sweep_dead(r);
     let _g = r.lock_guard().map_err(Error::Init)?;
     let slot = r.slot(handle).filter(|s| unsafe { (**s).obj_type } == TYPE_EVENT).ok_or(Error::Invalid)?;
     let prev = unsafe {
@@ -915,7 +924,6 @@ pub fn mutex_unlock(handle: u32, owner: u32) -> Result<u32, Error> {
         return Err(Error::Invalid);
     }
     let r = region()?;
-    auto_sweep_dead(r);
     let slot = r.slot(handle).filter(|s| unsafe { ld32(&(**s).obj_type) } == TYPE_MUTEX).ok_or(Error::Invalid)?;
     let w0 = unsafe { &(*slot).w0 };
     loop {
@@ -1349,8 +1357,11 @@ fn try_satisfy(
         None
     } else {
         // Acquire one by one; roll back if any object is busy. Stack array:
-        // handles.len() <= MAX_WAIT_COUNT, so no heap allocation.
-        let mut acquired = [(0usize, false); MAX_WAIT_COUNT];
+        // handles.len() <= MAX_WAIT_COUNT, so no heap allocation. Entries
+        // are write-before-read (0..n_acquired), so leave them uninit
+        // rather than zeroing 1 KB on every wait-all fast path.
+        let mut acquired: [std::mem::MaybeUninit<(usize, bool)>; MAX_WAIT_COUNT] =
+            [std::mem::MaybeUninit::uninit(); MAX_WAIT_COUNT];
         let mut n_acquired = 0usize;
         let mut owner_dead = false;
         for (i, h) in handles.iter().enumerate() {
@@ -1358,11 +1369,12 @@ fn try_satisfy(
             match try_acquire(slot, owner, entry_seqs[i]) {
                 Some(od) => {
                     owner_dead |= od;
-                    acquired[n_acquired] = (i, od);
+                    acquired[n_acquired].write((i, od));
                     n_acquired += 1;
                 }
                 None => {
-                    for &(j, od) in &acquired[..n_acquired] {
+                    for a in &acquired[..n_acquired] {
+                        let &(j, od) = unsafe { a.assume_init_ref() };
                         rollback_acquire(
                             unsafe { &*r.slot_ptr(handles[j] & INDEX_MASK) },
                             owner,
@@ -1556,6 +1568,12 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
         let seq = unsafe { (*r.node_ptr(head)).seq.load(Ordering::Acquire) };
         drop(_g);
 
+        // Going to sleep: a thread with slack, so this is the right place
+        // for the rate-limited dead-process sweep. Deliberately NOT hooked
+        // into the lock-free signal ops, so a scan never lands on a
+        // latency-critical signaler (e.g. a render thread's SetEvent).
+        auto_sweep_dead(r);
+
         // With NTSYNC_DEBUG=1, cap each futex wait at 5s so a stuck wait
         // periodically dumps the object states to stderr.
         let slice = if debug {
@@ -1644,7 +1662,16 @@ fn sweep_dead_locked(r: &Region) -> u32 {
         }
     }
     let mut freed = 0;
-    for index in 0..SLOT_COUNT {
+    // Only slots below the allocation cursor were ever handed out — until
+    // the cursor wraps (SCAN_WRAPPED), higher slots are sparse zero pages
+    // that must not be faulted in just to discover pid == 0.
+    let header = r.header();
+    let slot_hi = if header.next_scan & SCAN_WRAPPED != 0 {
+        SLOT_COUNT
+    } else {
+        header.next_scan
+    };
+    for index in 0..slot_hi {
         let slot = r.slot_ptr(index);
         unsafe {
             if (*slot).state == SLOT_USED && (*slot).pid != 0 && !pid_alive((*slot).pid) {
@@ -1674,12 +1701,13 @@ fn sweep_interval_ns() -> u64 {
     })
 }
 
-/// Rate-limited, region-wide opportunistic sweep. Called from signal ops
-/// and from the wait timeout path. Costs ~1ns in the common case: a
-/// process-local counter gates the (vDSO, ~20ns) clock read to every
-/// 256th call, and the region-wide interval check is then one relaxed
-/// atomic load. The region lock serializes concurrent sweepers; sweep_ns
-/// is re-checked under it.
+/// Rate-limited, region-wide opportunistic sweep. Called only from wait
+/// paths (before sleeping, and on timeout): threads with slack, so a
+/// scan never lands on a latency-critical signaler. Costs ~1ns in the
+/// common case: a thread-local counter gates the (vDSO, ~20ns) clock
+/// read to every 256th call, and the region-wide interval check is then
+/// one relaxed atomic load. The region lock serializes concurrent
+/// sweepers; sweep_ns is re-checked under it.
 fn auto_sweep_dead(r: &Region) {
     // Thread-local counter: ~1ns per call, no cacheline sharing. Sweep
     // promptness is unaffected: under any real load 256 signal ops pass

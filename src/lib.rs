@@ -317,9 +317,13 @@ mod tests {
         let mut status = 0;
         unsafe { libc::waitpid(pid, &mut status, 0) };
         // The orphan exists: an explicit sweep would find it. Instead, an
-        // ordinary signal op must reap it via the auto-sweep path.
+        // ordinary blocking wait must reap it via the auto-sweep path
+        // (triggered before a waiter goes to sleep).
         test_reset_sweep_clock();
-        event_set(mine).unwrap();
+        assert_eq!(
+            wait_any(&[mine], std::process::id() as u32, Some(std::time::Duration::from_millis(10)), 0),
+            WaitOutcome::Timeout
+        );
         assert_eq!(sweep_dead().unwrap(), 0, "auto-sweep should have reaped the orphan");
         assert!(close(mine));
     }

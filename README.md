@@ -56,10 +56,11 @@ mutex consistent.
 - `NTSYNC_SWEEP_INTERVAL_SEC` — auto-sweep cadence for dead-process
   cleanup, default 30. The kernel driver reaps a dead process's objects
   via fd release; userspace has no such hook, so the library runs the
-  `ntsync_sweep_dead()` cleanup on its own, rate-limited region-wide:
-  signal ops and wait timeouts check a shared timestamp (a thread-local
-  counter gates the check, ~1 ns/op), and slot allocation on a full
-  table always sweeps first. `0` disables auto-sweeping (explicit
+  `ntsync_sweep_dead()` cleanup on its own, rate-limited region-wide.
+  It is triggered only from wait paths (before a waiter sleeps, and on
+  wait timeouts) — threads that have slack, so a scan never lands on a
+  latency-critical signaler — and slot allocation on a full table always
+  sweeps first. `0` disables auto-sweeping (explicit
   `ntsync_sweep_dead()` still works).
 
 ## Layout
