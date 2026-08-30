@@ -62,6 +62,22 @@ mutex consistent.
   latency-critical signaler — and slot allocation on a full table always
   sweeps first. `0` disables auto-sweeping (explicit
   `ntsync_sweep_dead()` still works).
+- `NTSYNC_SPIN_ITERS` — bounded spin-before-block, default `0` (off).
+  When > 0, a waiter whose wait did not succeed on the fast path spins
+  up to N iterations on a read-only acquire check before sleeping on the
+  futex; a signal landing inside the window is acquired lock-free,
+  avoiding a sleep+wake pair (two context switches). The spin is
+  adaptive per thread (JVM-style credit: wins grant budget, exhausted
+  spins cost double, out-of-credit threads only probe every 8th wait),
+  so threads whose waits are genuinely long (e.g. 1 ms vsync polls)
+  stop paying the spin tax automatically while short-handoff threads
+  (mutex ping-pong) keep winning. Measured on the host: ~3x lower CPU
+  and ~98% fewer context switches on a pure handoff benchmark
+  (bench_3), ~+5% CPU on a mixed load dominated by long waits
+  (bench_4). Device-tune: 100-300 is the sensible range; each iteration
+  is a shared-cache-line load (tens of ns under contention).
+  `spin_wins`/`spin_exhausted` in the NTSYNC_DEBUG stats show the
+  hit rate.
 
 ## Layout
 

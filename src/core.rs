@@ -1156,7 +1156,7 @@ fn debug_log(msg: &str) {
 mod stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    pub const NAMES: [&str; 13] = [
+    pub const NAMES: [&str; 15] = [
         "wait_calls",        // total wait_any/wait_all calls
         "wait_fast_ok",      // satisfied without any lock
         "wait_blocked",      // actually slept on a futex
@@ -1170,12 +1170,14 @@ mod stats {
         "wake_lat_cnt",      // wakes with a timestamp sample
         "wake_lat_us_sum",   // total wake latency (signal -> waiter running), us
         "wake_lat_us_max",   // worst wake latency, us
+        "spin_wins",         // waits satisfied during the pre-sleep spin
+        "spin_exhausted",    // spins that still ended in a futex sleep
     ];
-    pub static COUNTERS: [AtomicU64; 13] = [
+    pub static COUNTERS: [AtomicU64; 15] = [
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-        AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
     ];
 
     #[inline]
@@ -1568,6 +1570,78 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
         let seq = unsafe { (*r.node_ptr(head)).seq.load(Ordering::Acquire) };
         drop(_g);
 
+        // Bounded spin before sleeping (NTSYNC_SPIN_ITERS, default 0 = off):
+        // a signal that lands within the window is acquired lock-free,
+        // avoiding a futex sleep + wake pair (two context switches) and the
+        // signaler's wake walk. Correctness does not depend on the spin:
+        // nodes stay registered, so a signaler either hands the state to our
+        // try_satisfy CAS or detaches us and bumps seq, in which case
+        // futex_wait below returns EAGAIN and the loop re-attempts. The
+        // entry_seqs snapshot is not refreshed during the spin, so a pulse
+        // shorter than the window can be missed - identical semantics to a
+        // short sleep (woken waiters re-check with the same snapshot).
+        let spin = spin_budget();
+        if spin > 0 {
+            // Reaching the end of the loop without winning means the
+            // spin did not pay off - penalize below. The detached-mid-
+            // spin break is neutral: a signaler DID target us, we just
+            // lost the CAS race for the state; that is a timing race,
+            // not evidence that spinning is useless for this thread.
+            let mut neutral = false;
+            for _ in 0..spin {
+                if alert != 0 {
+                    let s = r.slot(alert).expect("validated above");
+                    if ld64(unsafe { &(*s).w0 }) as u32 != 0 {
+                        stat_bump(13); // spin_wins (alert)
+                        spin_credit_reward();
+                        if let Ok(g) = r.lock_guard() {
+                            waiter_cleanup(r, &mut nodes);
+                            drop(g);
+                        }
+                        return WaitOutcome::Signaled {
+                            index: handles.len() as u32,
+                            owner_dead: false,
+                        };
+                    }
+                }
+                // Read-only peek first: a failed try_satisfy still CASes
+                // the object words, and N spinners CASing one word turns
+                // the cache line into a ping-pong that slows the very
+                // owner we are waiting for. Only attempt the real acquire
+                // when the load-only check says it could succeed (any
+                // object for WAIT_ANY, all for WAIT_ALL).
+                let peek = handles.iter().enumerate().any(|(i, h)| {
+                    is_locked(unsafe { &*r.slot_ptr(h & INDEX_MASK) }, owner, entry_seqs[i])
+                }) && (!all || handles.iter().enumerate().all(|(i, h)| {
+                    is_locked(unsafe { &*r.slot_ptr(h & INDEX_MASK) }, owner, entry_seqs[i])
+                }));
+                if peek {
+                    if let Some(outcome) = try_satisfy(r, handles, owner, &entry_seqs, all) {
+                        stat_bump(13); // spin_wins
+                        if let Ok(g) = r.lock_guard() {
+                            waiter_cleanup(r, &mut nodes);
+                            drop(g);
+                        }
+                        spin_credit_reward();
+                        return outcome;
+                    }
+                }
+                // A signaler detached us mid-spin: the wake was directed at
+                // us but the state went to someone else (or the object was
+                // closed). Stop spinning; futex_wait returns EAGAIN and the
+                // locked section re-registers or fails validation.
+                if unsafe { ld32(&(*r.node_ptr(head)).registered) } == 0 {
+                    neutral = true;
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            if !neutral {
+                stat_bump(14); // spin_exhausted
+                spin_credit_penalize();
+            }
+        }
+
         // Going to sleep: a thread with slack, so this is the right place
         // for the rate-limited dead-process sweep. Deliberately NOT hooked
         // into the lock-free signal ops, so a scan never lands on a
@@ -1699,6 +1773,65 @@ fn sweep_interval_ns() -> u64 {
             .unwrap_or(30);
         secs * 1_000_000_000
     })
+}
+
+/// Max spin iterations per blocking wait. NTSYNC_SPIN_ITERS sets it;
+/// default 0 (disabled) so behavior is unchanged unless explicitly
+/// opted in. Capped at 100k to bound silly values. Each iteration is a
+/// handful of atomic loads (~10-20ns), so e.g. 200 iters costs ~2-4us
+/// of CPU in exchange for every avoided sleep/wake pair.
+fn spin_max_iters() -> u32 {
+    static ITERS: OnceLock<u32> = OnceLock::new();
+    *ITERS.get_or_init(|| {
+        std::env::var("NTSYNC_SPIN_ITERS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(100_000)
+    })
+}
+
+// Adaptive spin credit (per thread): spinning pays off only for waiters
+// whose waits are usually satisfied quickly (mutex handoffs); threads
+// whose waits routinely time out (e.g. a 1ms vsync poll) would burn CPU
+// for nothing. Track outcomes like JVM adaptive spinning: a win adds
+// credit, an exhausted spin costs double, and only threads in credit
+// spin at all. Starts at 1 so every thread gets one chance to prove it
+// wins. Purely thread-local: ~1ns overhead.
+thread_local! {
+    static SPIN_CREDIT: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+    static SPIN_PROBE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Iterations this thread may spin now. Threads in credit get the full
+/// env-capped budget. Threads out of credit only probe every 8th blocked
+/// wait with a small budget, so a workload that changed back to short
+/// waits can re-earn credit without always-spin losers (e.g. a 1ms
+/// vsync poll) paying a spin tax on every wait forever.
+fn spin_budget() -> u32 {
+    let max = spin_max_iters();
+    if max == 0 {
+        return 0;
+    }
+    SPIN_CREDIT.with(|c| {
+        if c.get() > 0 {
+            max
+        } else {
+            SPIN_PROBE.with(|p| {
+                let n = p.get().wrapping_add(1);
+                p.set(n);
+                if n % 8 == 0 { (max / 8).clamp(8, 64) } else { 0 }
+            })
+        }
+    })
+}
+
+fn spin_credit_reward() {
+    SPIN_CREDIT.with(|c| c.set((c.get() + 1).min(16)));
+}
+
+fn spin_credit_penalize() {
+    SPIN_CREDIT.with(|c| c.set((c.get() - 2).max(-8)));
 }
 
 /// Rate-limited, region-wide opportunistic sweep. Called only from wait
