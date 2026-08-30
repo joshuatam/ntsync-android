@@ -79,6 +79,50 @@ mutex consistent.
   `spin_wins`/`spin_exhausted` in the NTSYNC_DEBUG stats show the
   hit rate.
 
+### When to enable spinning (per-game guide)
+
+Spinning pays off only when a game's waits are **short handoffs** —
+a waiter blocks and the signal lands within a few microseconds (mutex
+protecting a tiny critical section, fine-grained job/task dispatch).
+It is wasted on **rendezvous** waits, where the waiter blocks because
+the work genuinely is not ready yet (producer-consumer pacing, vsync
+polling) and the signal arrives hundreds of microseconds later.
+
+Measured on device (Snapdragon-class, NTSYNC_DEBUG stats):
+
+| Game | waits/s | wake_walks/ signal_ops | spin win rate | NTSYNC_SPIN_ITERS |
+|---|---|---|---|---|
+| Persona 5 Royal | 61k avg, 300k burst | 1% | **60-76% in bursts** | **300** |
+| Dishonored | 11k | 5% | 3% | 0 |
+| Lies of P | 3k | 67% | 1.4% | 0 |
+| Hades II | 0.5k | 68% | 0.2% | 0 |
+
+The signal is the **wake_walks ratio**: games where most signals are
+no-op chatter (low ratio, waits usually short) tend to benefit; games
+where most signals genuinely wake someone (high ratio, waits are
+rendezvous) never do. P5R's profile — extreme bursts of hundreds of
+thousands of waits/s with signals landing almost immediately — is the
+fine-grained job-dispatch pattern spinning was built for.
+
+A P5R control run with spin at 0 showed the identical wait profile
+(same burst timing, wake latency, signal volume): spinning only
+removes sleeps (25-28% of blocked waits during bursts), it does not
+change game behavior. Note Denuvo titles like P5R run background
+anti-tamper threads whose chatter-heavy, microsecond-handoff sync
+pattern is exactly the spin-friendly quadrant, so Denuvo games are
+prime candidates for the 5-minute test below.
+
+The adaptive credit makes a wrong setting cheap rather than harmful
+(threads that never win degrade to a 1/8 probe rate, ~0.2% of one
+core), but 0 remains the correct default. To decide for a new game:
+
+1. Run 5 minutes of the *busiest* gameplay with
+   `NTSYNC_DEBUG=1 NTSYNC_SPIN_ITERS=300`.
+2. Check `spin_wins` vs `spin_exhausted` in the dump: keep 300 when
+   the win rate is > ~20%; set 0 otherwise.
+3. When in doubt, leave it 0 — a bad spin setting gains nothing,
+   it only wastes a little battery.
+
 ## Layout
 
 - `src/core.rs` — shm object table + futex wait engine (unit-tested on host,
