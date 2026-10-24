@@ -78,6 +78,25 @@ mutex consistent.
   is a shared-cache-line load (tens of ns under contention).
   `spin_wins`/`spin_exhausted` in the NTSYNC_DEBUG stats show the
   hit rate.
+- `NTSYNC_SPIN_TAIL_US` — deadline spin tail, default `0` (off), capped
+  at 2000. When a wait has a timeout, the last N microseconds before the
+  deadline are spun instead of parked. A futex timeout cannot fire closer
+  than the process's timer slack (50 us under bionic), which is what a
+  frame-pacing wait is measured against, so this is the difference between
+  landing on the frame boundary and landing 60-100 us late. Measured on an
+  idle 8 Elite (Android 15, 1 ms frame budget): overshoot p50 106 us ->
+  1.1 us, p99 132 us -> 1.4 us. Opt in only for a thread that is pacing
+  frames; a 150-200 us tail is the useful range and it burns that much CPU
+  per frame while enabled.
+  On a loaded mid-tier device (Dimensity 8400, load average ~20, 1 ms
+  budget) the same knob gave p50 118 us -> 5 us but p99 670 us -> 490 us
+  only, for ~165 us of CPU per frame: a spin lands on time only if it gets
+  the CPU, so this is a quiet-device optimisation of the median, not a fix
+  for loaded-device jitter. Gate it on the `SPIN_CREDIT` mechanism
+  `NTSYNC_SPIN_ITERS` uses before offering it as a general setting.
+  Cheaper alternative for an app that controls the process:
+  `prctl(PR_SET_TIMERSLACK, 1)` — 106 us -> 20-56 us p50 on the idle
+  device, 118 us -> 64 us on the loaded one, no spin cost.
 
 ### When to enable spinning (per-game guide)
 

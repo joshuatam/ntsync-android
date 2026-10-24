@@ -1656,6 +1656,28 @@ fn wait(handles: &[u32], owner: u32, timeout: Option<Duration>, all: bool, alert
             remaining
         };
 
+        // Spin tail: a futex timeout cannot fire closer than the process's
+        // timer slack, so hand the last `tail` of the wait to a spin instead
+        // of parking it. Short waits spin immediately; longer ones park for
+        // the part before the tail, and the next iteration lands here to spin
+        // out the remainder.
+        let slice = match (spin_tail(), slice) {
+            (Some(tail), Some(left)) if left > tail => Some(left - tail),
+            _ => slice,
+        };
+        if let (Some(tail), Some(left)) = (spin_tail(), slice) {
+            if left <= tail {
+                let word = unsafe { &(*r.node_ptr(head)).seq };
+                let dl = std::time::Instant::now() + left;
+                while std::time::Instant::now() < dl {
+                    if word.load(Ordering::Acquire) != seq {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                continue;
+            }
+        }
         stat_bump(3); // futex_sleeps
         let ret = futex_wait(unsafe { &(*r.node_ptr(head)).seq }, seq, slice);
         if ret == 0 && debug {
@@ -1940,6 +1962,25 @@ fn spin_max_iters() -> u32 {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0)
             .min(100_000)
+    })
+}
+
+/// Deadline spin tail. When a wait is within this many microseconds of its
+/// timeout, spin to the deadline instead of parking the thread: a futex
+/// timeout cannot fire closer than the process's timer slack (50 us under
+/// bionic, which is what a frame-pacing wait is measured against), so the
+/// last stretch is the difference between landing on the frame boundary and
+/// landing 60+ us late. NTSYNC_SPIN_TAIL_US sets it; default 0 (disabled)
+/// so nothing changes unless a caller opts in. Capped at 2000 us.
+fn spin_tail() -> Option<Duration> {
+    static TAIL: OnceLock<Option<Duration>> = OnceLock::new();
+    *TAIL.get_or_init(|| {
+        let us = std::env::var("NTSYNC_SPIN_TAIL_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(2000);
+        (us > 0).then(|| Duration::from_micros(us))
     })
 }
 

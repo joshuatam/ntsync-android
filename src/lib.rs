@@ -22,6 +22,12 @@ pub mod ffi;
 #[cfg(test)]
 mod bench;
 
+#[cfg(test)]
+mod engine_sim;
+
+#[cfg(test)]
+mod soak;
+
 pub use core::{Error, WaitOutcome, MAX_WAIT_COUNT};
 
 #[cfg(test)]
