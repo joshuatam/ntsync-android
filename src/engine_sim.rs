@@ -497,6 +497,47 @@ fn sim_vsync_pacing() {
     let _ = close(never);
 }
 
+/// One library wait per frame and nothing else, so cpu/frame is the cost of
+/// the wait path alone. This is the instrument for the spin-tail knobs: with
+/// a tail configured the wait spins its last `NTSYNC_SPIN_TAIL_US`, and
+/// `NTSYNC_SPIN_TAIL_BUDGET_PCT` caps how much of a core that may cost, so
+/// an A/B over the budget shows the gate binding (cpu/frame falls, overshoot
+/// returns to the parked profile).
+#[test]
+#[ignore]
+fn sim_wait_only_pacing() {
+    setup();
+    const FPS: u32 = 1000;
+    const FRAMES: usize = 2000;
+
+    let never = create_event(false, false).unwrap();
+    let period = Duration::from_secs_f64(1.0 / FPS as f64);
+    let tail = std::env::var("NTSYNC_SPIN_TAIL_US").unwrap_or_else(|_| "off".into());
+    let pct = std::env::var("NTSYNC_SPIN_TAIL_BUDGET_PCT").unwrap_or_else(|_| "default".into());
+
+    let cpu0 = cpu_time();
+    let mut over = Hist::with_capacity(FRAMES);
+    let mut next = Instant::now();
+    for _ in 0..FRAMES {
+        next += period;
+        let now = Instant::now();
+        if next > now {
+            let left = next - now;
+            let t = Instant::now();
+            let _ = wait_any(&[never], me(), Some(left), 0);
+            over.push(t.elapsed().saturating_sub(left));
+        }
+    }
+    let cpu = cpu_time().saturating_sub(cpu0) / FRAMES as u32;
+    println!(
+        "--- wait-only pacing at {FPS} fps, tail={tail}us budget={pct}%, \
+         cpu/frame {:.2}us",
+        cpu.as_secs_f64() * 1e6
+    );
+    over.report("wait-only overshoot");
+    let _ = close(never);
+}
+
 // ---------------------------------------------------- cross-process lock ---
 
 /// What wineserver does to the shared region while a game runs: object create

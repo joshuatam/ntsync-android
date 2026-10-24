@@ -46,6 +46,9 @@ fn me() -> u32 {
 /// Drive enough waits to pass the 256-call sweep gate, with timeouts so each
 /// one takes the ETIMEDOUT path where the opportunistic sweep lives.
 fn trigger_sweeps(ev: u32, calls: usize) {
+    // Force the region-wide interval to look elapsed, so a pass is guaranteed
+    // to run inside these calls instead of depending on wall time.
+    test_reset_sweep_clock();
     for _ in 0..calls {
         let _ = wait_any(&[ev], me(), Some(Duration::from_millis(1)), 0);
     }
@@ -77,6 +80,31 @@ fn check_canaries(tag: &str) {
     assert!(mutex_unlock(mtx, me()).is_ok(), "{tag}: mutex release failed");
 
     assert!(close(ev) && close(sem) && close(mtx), "{tag}: close failed");
+}
+
+/// Holder bookkeeping: retain is idempotent per process and release clears the
+/// entry, so a holder cannot inflate its own record into a permanent leak.
+#[test]
+#[ignore]
+fn soak_holder_bookkeeping() {
+    setup();
+    let h = create_event(false, false).unwrap();
+    assert_eq!(test_holders(h).unwrap().1, Vec::<u32>::new());
+
+    assert_eq!(retain(h), Ok(()));
+    assert_eq!(test_holders(h).unwrap().1, vec![me()]);
+    assert_eq!(retain(h), Ok(()), "retain is idempotent");
+    assert_eq!(test_holders(h).unwrap().1, vec![me()], "duplicate holder entry");
+
+    assert_eq!(release(h), Ok(()));
+    assert_eq!(test_holders(h).unwrap().1, Vec::<u32>::new());
+    assert_eq!(release(h), Ok(()), "release of a non-holder is a no-op");
+
+    // close() also drops the holder entry.
+    assert_eq!(retain(h), Ok(()));
+    assert!(close(h));
+    assert!(test_holders(h).is_none(), "slot freed but still resolvable");
+    assert!(retain(h).is_err(), "retain on a freed handle must fail");
 }
 
 /// Repeated process death under a fast sweep: the sweep must never damage a
@@ -130,9 +158,10 @@ fn soak_process_death_under_sweep() {
     let _ = close(trigger);
 }
 
-/// Handle relay across process death: what a relayed handle is worth after the
-/// creator exits. Recorded per phase rather than asserted, because it is a
-/// design difference from the kernel driver (fd keeps the object alive).
+/// Handle relay across process death, the defect this branch fixes: a handle
+/// passed to another process must survive its creator the way a duplicated fd
+/// does under the kernel driver. Without `retain` it is reaped at the next
+/// pass; with it the object lives until the holder releases or dies.
 #[test]
 #[ignore]
 fn soak_relayed_handle_after_creator_death() {
@@ -163,16 +192,53 @@ fn soak_relayed_handle_after_creator_death() {
     unsafe { libc::waitpid(pid, &mut status, 0) };
     let relayed = u32::from_ne_bytes(bytes);
 
-    println!(
-        "soak: relayed handle {relayed:#x} from dead pid {}, creator-death semantics:",
-        pid
-    );
+    // Unretained: the sweep is entitled to reap it once the creator is gone.
+    println!("soak: relayed handle {relayed:#x} from dead pid {pid}, without retain:");
     println!("  before any sweep:  usable = {}", read_event(relayed).is_ok());
-    println!("  signal it:         ok     = {}", event_set(relayed).is_ok());
-
-    // Force an opportunistic sweep: still alive, so reaping must not happen.
     trigger_sweeps(trigger, 512);
     println!("  after one sweep:   usable = {}", read_event(relayed).is_ok());
+
+    // Retained: now it must outlive the creator until this process lets go.
+    let mut fds2 = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds2.as_mut_ptr()) }, 0);
+    let (rd2, wr2) = (fds2[0], fds2[1]);
+    let pid2 = unsafe { libc::fork() };
+    assert!(pid2 >= 0);
+    if pid2 == 0 {
+        let h = create_event(false, false).unwrap();
+        unsafe {
+            libc::write(wr2, h.to_ne_bytes().as_ptr() as *const _, 4);
+            libc::_exit(0)
+        }
+    }
+    unsafe { libc::close(wr2) };
+    let mut bytes2 = [0u8; 4];
+    assert_eq!(
+        unsafe { libc::read(rd2, bytes2.as_mut_ptr() as *mut _, 4) },
+        4
+    );
+    unsafe { libc::close(rd2) };
+    let mut status2 = 0;
+    unsafe { libc::waitpid(pid2, &mut status2, 0) };
+    let kept = u32::from_ne_bytes(bytes2);
+
+    println!("soak: relayed handle {kept:#x} from dead pid {pid2}, with retain:");
+    assert_eq!(retain(kept), Ok(()), "retain failed");
+    println!("  after retain:      usable = {}", read_event(kept).is_ok());
+    trigger_sweeps(trigger, 512);
+    assert!(
+        read_event(kept).is_ok(),
+        "retained object was reaped after its creator died"
+    );
+    assert!(event_set(kept).is_ok(), "retained object stopped working");
+    println!("  after one sweep:   usable = true, signal ok");
+    assert!(release(kept).is_ok(), "release failed");
+    trigger_sweeps(trigger, 512);
+    assert!(
+        read_event(kept).is_err(),
+        "object still alive after the last holder released it"
+    );
+    println!("  after release:     usable = false (reaped as expected)");
 
     let _ = close(trigger);
 }

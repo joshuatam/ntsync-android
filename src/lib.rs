@@ -454,6 +454,21 @@ mod tests {
     }
 
     #[test]
+    fn tail_budget_burst_is_frames_not_seconds() {
+        // The burst allowance must be the budget's rate over ~10 ms, so a
+        // thread that spends faster than it refills is throttled within a
+        // few frames. A bucket holding the whole per-second allowance would
+        // let 150 us/frame run unthrottled for seconds.
+        assert_eq!(crate::core::test_tail_budget_cap(100_000_000), 1_000_000);
+        assert_eq!(crate::core::test_tail_budget_cap(150_000_000), 1_500_000);
+        // A 150 us tail fits ~6 times in the 15% burst.
+        assert!(crate::core::test_tail_budget_cap(150_000_000) / 150_000 >= 5);
+        // Never zero: a tiny budget must still be able to grant something.
+        assert_eq!(crate::core::test_tail_budget_cap(1), 1);
+        assert_eq!(crate::core::test_tail_budget_cap(0), 1);
+    }
+
+    #[test]
     fn auto_sweep_claims_interval_when_nothing_dead() {
         setup();
         let h = create_event(false, false).unwrap();
